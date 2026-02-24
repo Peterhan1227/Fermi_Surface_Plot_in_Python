@@ -1,0 +1,9 @@
+pyproject.toml
+src/BZPlotter/__init__.py
+src/BZPlotter/linalg.py
+src/BZPlotter/plane.py
+src/bzplotter.egg-info/PKG-INFO
+src/bzplotter.egg-info/SOURCES.txt
+src/bzplotter.egg-info/dependency_links.txt
+src/bzplotter.egg-info/requires.txt
+src/bzplotter.egg-info/top_level.txt

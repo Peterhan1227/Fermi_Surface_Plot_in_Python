@@ -1,0 +1,6 @@
+Metadata-Version: 2.4
+Name: bzplotter
+Version: 0.1.0
+Summary: Fermi-surface slicing and quantum oscillation utilities
+Requires-Python: >=3.10
+Requires-Dist: numpy
