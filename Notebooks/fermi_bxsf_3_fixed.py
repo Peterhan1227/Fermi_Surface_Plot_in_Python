@@ -160,24 +160,6 @@ def draw_bz_boundary(ax, lattice, nmax=2):
         ax.plot3D(*zip(p0, p1), color="black", lw=1.3, alpha=0.8)
 
 
-def _wrap_triangles_in_frac_cell(k_frac, faces, lattice, center=0.5):
-    """
-    Wrap triangles coherently into one periodic image to avoid seam-spanning faces.
-
-    We choose one lattice translation per triangle from its center, then apply that
-    translation to all three triangle vertices.
-    """
-    tri_frac = k_frac[faces]  # (Nf,3,3)
-    tri_centers = tri_frac.mean(axis=1)
-    tri_centers_wrapped = lattice.wrap_frac(tri_centers, center=center)
-    shifts = tri_centers - tri_centers_wrapped
-    tri_wrapped = tri_frac - shifts[:, None, :]
-
-    verts_wrapped = lattice.frac_to_cart(tri_wrapped.reshape(-1, 3))
-    faces_wrapped = np.arange(len(verts_wrapped), dtype=int).reshape(-1, 3)
-    return verts_wrapped, faces_wrapped
-
-
 def plot_fermi_surface(
     data,
     band_idx,
@@ -188,6 +170,17 @@ def plot_fermi_surface(
     wrap_center=0.5,
     manual_shift=(0.0, 0.0, 0.0),
 ):
+    """
+    Plot an isosurface E(k)=E_F for a selected band.
+
+    Key conventions you can tune to match other viewers (e.g. FermiSurfer):
+    - data["origin"] is respected (BXSF declares the fractional origin of the grid).
+    - wrap_center chooses which periodic image to display:
+        wrap_center=0.5 -> wrap into [-0.5,0.5) (Gamma-centered)
+        wrap_center=0.0 -> wrap into [0,1)     (corner-origin)
+    - manual_shift (fractional, in units of b1,b2,b3) lets you nudge the image by
+      a reciprocal-lattice translation before wrapping.
+    """
     ef = data["fermi_energy"]
     grid = data["band_data"][band_idx]
     nx, ny, nz = data["grid_dimensions"]
@@ -196,6 +189,7 @@ def plot_fermi_surface(
 
     verts, faces, _, _ = marching_cubes(grid, ef)
 
+    # marching_cubes returns vertices in "voxel index" coords. Convert to fractional grid coords in [0,1].
     frac_grid = np.column_stack(
         [
             verts[:, 0] / (nx - 1),
@@ -204,23 +198,20 @@ def plot_fermi_surface(
         ]
     )
 
+    # Respect BXSF origin, then optionally shift and wrap into a canonical reciprocal cell.
     origin = np.asarray(data.get("origin", (0.0, 0.0, 0.0)), dtype=float).reshape(3)
     shift = np.asarray(manual_shift, dtype=float).reshape(3)
     k_frac = origin + frac_grid + shift
+    k_frac = lattice.wrap_frac(k_frac, center=wrap_center)
 
-    if wrap_center is None:
-        verts_base = lattice.frac_to_cart(k_frac)
-        faces_base = faces
-    else:
-        verts_base, faces_base = _wrap_triangles_in_frac_cell(
-            k_frac, faces, lattice, center=wrap_center
-        )
+    # Map fractional reciprocal coords -> Cartesian k (Å^-1).
+    verts_base = lattice.frac_to_cart(k_frac)
 
     verts_plot = verts_base
-    faces_plot = faces_base
+    faces_plot = faces
     if fold_ws:
         # Fold after marching-cubes connectivity is built: one translation per triangle.
-        tri = verts_base[faces_base]
+        tri = verts_base[faces]
         centers = tri.mean(axis=1)
         centers_folded = fold_to_wigner_seitz(centers, lattice, nmax=2)
         shifts = centers - centers_folded
@@ -248,6 +239,7 @@ def plot_fermi_surface(
         edgecolor="none",
     )
 
+    # WS Brillouin zone boundary (a hexagonal prism for hexagonal lattices).
     draw_bz_boundary(ax, lattice, nmax=2)
 
     hs_points = get_high_symmetry_points(lattice_type, lattice, points_file=points_file)
@@ -260,29 +252,24 @@ def plot_fermi_surface(
     ax.quiver(0, 0, 0, 0, max_dim, 0, color="g", arrow_length_ratio=0.1)
     ax.quiver(0, 0, 0, 0, 0, max_dim, color="b", arrow_length_ratio=0.1)
 
-    if wrap_center is None:
-        wrap_label = "none"
-    elif wrap_center == 0.5:
-        wrap_label = "gamma"
-    elif wrap_center == 0.0:
-        wrap_label = "corner"
-    else:
-        wrap_label = f"{wrap_center:g}"
-
     ax.set_title(
-        f"Band {band_idx} Fermi Surface\n"
-        f"Lattice: {lattice_type.capitalize()} | Fold to WS: {fold_ws} | Wrap: {wrap_label}"
+        f"Band {band_idx} Fermi Surface"
+
+        f"Lattice: {lattice_type.capitalize()} | Fold to WS: {fold_ws} | wrap_center={wrap_center}"
     )
     ax.set_axis_off()
     ax.set_box_aspect([1, 1, 1])
     plt.show()
 
-
 if __name__ == "__main__":
     path = input("Path to .bxsf file: ").strip()
     lat_type = input("Lattice type (cubic/hexagonal/tetragonal): ").strip().lower() or "cubic"
     default_points = Path(path).resolve().parent / "HIGH_SYMMETRY_POINTS"
-    msg = f"Path to HIGH_SYMMETRY_POINTS [{default_points}]: " if default_points.exists() else "Path to HIGH_SYMMETRY_POINTS [optional]: "
+    msg = (
+        f"Path to HIGH_SYMMETRY_POINTS [{default_points}]: "
+        if default_points.exists()
+        else "Path to HIGH_SYMMETRY_POINTS [optional]: "
+    )
     points_input = input(msg).strip()
     points_file = points_input or (str(default_points) if default_points.exists() else None)
 
@@ -293,18 +280,10 @@ if __name__ == "__main__":
     fold_input = input("Fold surface into WS 1st BZ? (Y/n): ").strip().lower()
     fold_ws = fold_input not in ("n", "no")
 
-    wrap_in = input("Wrap for display (gamma/corner/none) [gamma]: ").strip().lower()
-    if wrap_in in ("", "g", "gamma", "gamma-centered"):
-        wrap_center = 0.5
-    elif wrap_in in ("c", "corner", "0"):
-        wrap_center = 0.0
-    elif wrap_in in ("n", "no", "none", "off"):
-        wrap_center = None
-    else:
-        print("Unknown wrap option; using gamma.")
-        wrap_center = 0.5
+    wrap_in = input("Wrap convention: Gamma-centered [-0.5,0.5) ? (Y/n): ").strip().lower()
+    wrap_center = 0.5 if wrap_in not in ("n", "no") else 0.0
 
-    shift_in = input("Manual fractional shift in (b1,b2,b3) units [0 0 0]: ").strip()
+    shift_in = input("Manual fractional shift in (b1,b2,b3) units [e.g. 0 0 0]: ").strip()
     if shift_in:
         try:
             manual_shift = tuple(map(float, shift_in.split()))
