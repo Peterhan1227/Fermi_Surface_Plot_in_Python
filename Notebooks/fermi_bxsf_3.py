@@ -22,10 +22,11 @@ def read_bxsf(filename):
         "origin": None,
         "vectors": None,
     }
-    if not os.path.exists(filename):
+    bxsf_path = Path(filename)
+    if not bxsf_path.exists():
         raise FileNotFoundError(f"File {filename} not found.")
 
-    with open(filename, "r", encoding="utf-8") as f:
+    with bxsf_path.open("r", encoding="utf-8") as f:
         lines = [line.strip() for line in f.readlines() if line.strip()]
 
     i = 0
@@ -260,21 +261,18 @@ def plot_fermi_surface(
     ax.quiver(0, 0, 0, 0, max_dim, 0, color="g", arrow_length_ratio=0.1)
     ax.quiver(0, 0, 0, 0, 0, max_dim, color="b", arrow_length_ratio=0.1)
 
-    if wrap_center is None:
-        wrap_label = "none"
-    elif wrap_center == 0.5:
-        wrap_label = "gamma"
-    elif wrap_center == 0.0:
-        wrap_label = "corner"
-    else:
-        wrap_label = f"{wrap_center:g}"
+    wrap_label = {None: "none", 0.5: "gamma", 0.0: "corner"}.get(wrap_center, f"{wrap_center:g}")
 
     ax.set_title(
         f"Band {band_idx} Fermi Surface\n"
         f"Lattice: {lattice_type.capitalize()} | Fold to WS: {fold_ws} | Wrap: {wrap_label}"
     )
     ax.set_axis_off()
-    ax.set_box_aspect([1, 1, 1])
+    xmin, xmax = ax.get_xlim3d()
+    ymin, ymax = ax.get_ylim3d()
+    zmin, zmax = ax.get_zlim3d()
+    ax.set_box_aspect((xmax - xmin, ymax - ymin, zmax - zmin))
+    ax.set_proj_type("ortho")  # optional, better for geometry comparison
     plt.show()
 
 

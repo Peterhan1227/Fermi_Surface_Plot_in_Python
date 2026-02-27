@@ -1,6 +1,6 @@
 """BXSF -> Fermi-surface plot + planar cross-section area -> dHvA frequency.
 
-Minimal "vibe coding" workflow:
+Workflow:
 - Read .bxsf (VASPKIT) band energy grids
 - (Optional) Plot 3D Fermi surface (marching cubes)
 - Define a plane (normal ~ B-field direction)
@@ -10,7 +10,6 @@ Minimal "vibe coding" workflow:
 
 from __future__ import annotations
 
-import os
 import sys
 from itertools import combinations, product
 from pathlib import Path
@@ -55,10 +54,11 @@ def read_bxsf(filename: str) -> dict:
         "origin": None,
         "vectors": None,
     }
-    if not os.path.exists(filename):
+    bxsf_path = Path(filename)
+    if not bxsf_path.exists():
         raise FileNotFoundError(filename)
 
-    with open(filename, "r", encoding="utf-8") as f:
+    with bxsf_path.open("r", encoding="utf-8") as f:
         lines = [line.strip() for line in f.readlines() if line.strip()]
 
     i = 0
@@ -92,7 +92,7 @@ def read_bxsf(filename: str) -> dict:
 
 
 # -------------------------
-# WS BZ wireframe helpers (from your fermi_bxsf_3)
+# WS BZ wireframe helpers (from fermi_bxsf_3)
 # -------------------------
 
 def _lattice_translations(lattice: ReciprocalLattice, nmax=2, include_zero=True):
@@ -186,8 +186,7 @@ def plot_fermi_surface(
     ef = data["fermi_energy"]
     grid = data["band_data"][band_idx]
     nx, ny, nz = data["grid_dimensions"]
-    vecs = np.array(data["vectors"], dtype=float)
-    lattice = ReciprocalLattice.from_B(vecs.T)
+    lattice = ReciprocalLattice.from_B(np.array(data["vectors"], dtype=float).T)
 
     verts, faces, _, _ = marching_cubes(grid, ef)
 
@@ -238,7 +237,11 @@ def plot_fermi_surface(
     draw_bz_boundary(ax, lattice, nmax=2)
     ax.set_title(f"Band {band_idx} Fermi Surface")
     ax.set_axis_off()
-    ax.set_box_aspect([1, 1, 1])
+    xmin, xmax = ax.get_xlim3d()
+    ymin, ymax = ax.get_ylim3d()
+    zmin, zmax = ax.get_zlim3d()
+    ax.set_box_aspect((xmax - xmin, ymax - ymin, zmax - zmin))
+    ax.set_proj_type("ortho")  # optional, better for geometry comparison
     plt.show()
 
 
@@ -288,15 +291,30 @@ def interp_trilinear_periodic(grid: np.ndarray, xyz: np.ndarray) -> np.ndarray:
     c0 = c00 * (1 - ty) + c10 * ty
     c1 = c01 * (1 - ty) + c11 * ty
 
+
     return c0 * (1 - tz) + c1 * tz
 
+def _default_orient_hint_from_normal(normal_cart: np.ndarray) -> np.ndarray:
+    """Build a perpendicular orient_hint from cross(normal, [1,0,0])."""
+    n = np.asarray(normal_cart, dtype=float).reshape(3)
+    n_norm = np.linalg.norm(n)
+    if n_norm < 1e-12:
+        raise ValueError("normal_cart is near zero; cannot define orient_hint.")
+    n = n / n_norm
+
+    ex = np.array([1.0, 0.0, 0.0], dtype=float)
+    hint = np.cross(n, ex)
+    if np.linalg.norm(hint) < 1e-12:
+        ey = np.array([0.0, 1.0, 0.0], dtype=float)
+        hint = np.cross(n, ey)
+    return hint
 
 def energies_on_plane_from_bxsf(
     data: dict,
     band_idx: int,
     center_cart: np.ndarray,
     normal_cart: np.ndarray,
-    orient_hint_cart: np.ndarray,
+    orient_hint_cart: np.ndarray | None = None,
     *,
     shape=(401, 401),
     half_range=(1.0, 1.0),
@@ -304,13 +322,26 @@ def energies_on_plane_from_bxsf(
     """Return (S,T,E2d,u,v,n,lattice) where E2d has shape (Ny,Nx)."""
     grid = data["band_data"][band_idx]
     nx, ny, nz = data["grid_dimensions"]
-    vecs = np.array(data["vectors"], dtype=float)
-    lattice = ReciprocalLattice.from_B(vecs.T)
+    lattice = ReciprocalLattice.from_B(np.array(data["vectors"], dtype=float).T)
+    normal_arr = np.asarray(normal_cart, dtype=float).reshape(3)
+    n_norm = np.linalg.norm(normal_arr)
+    if n_norm < 1e-12:
+        raise ValueError("normal_cart is near zero; cannot define slice plane.")
+
+    if orient_hint_cart is None:
+        orient_arr = _default_orient_hint_from_normal(normal_arr)
+    else:
+        orient_arr = np.asarray(orient_hint_cart, dtype=float).reshape(3)
+        o_norm = np.linalg.norm(orient_arr)
+        if o_norm < 1e-12:
+            orient_arr = _default_orient_hint_from_normal(normal_arr)
+        elif abs(np.dot(normal_arr / n_norm, orient_arr / o_norm)) > 0.999:
+            orient_arr = _default_orient_hint_from_normal(normal_arr)
 
     spec = PlaneSpec(
         center=np.asarray(center_cart, dtype=float).reshape(3),
-        normal=np.asarray(normal_cart, dtype=float).reshape(3),
-        orient_hint=np.asarray(orient_hint_cart, dtype=float).reshape(3),
+        normal=normal_arr,
+        orient_hint=orient_arr,
         shape=tuple(shape),
         half_range=tuple(half_range),
     )
@@ -391,23 +422,22 @@ def slice_and_dhva(
     *,
     center_frac=(0.0, 0.0, 0.0),
     normal_cart=(0.0, 0.0, 1.0),
-    orient_hint_cart=(1.0, 0.0, 0.0),
+    orient_hint_cart=None,
     shape=(401, 401),
     half_range=(1.0, 1.0),
     show=True,
 ):
     ef = float(data["fermi_energy"])
-    vecs = np.array(data["vectors"], dtype=float)
-    lattice = ReciprocalLattice.from_B(vecs.T)
+    lattice = ReciprocalLattice.from_B(np.array(data["vectors"], dtype=float).T)
 
     center_cart = lattice.frac_to_cart(np.asarray(center_frac, dtype=float))
 
-    S, T, E2d, u, v, n, _ = energies_on_plane_from_bxsf(
+    S, T, E2d, *_ = energies_on_plane_from_bxsf(
         data,
         band_idx,
         center_cart=center_cart,
         normal_cart=np.asarray(normal_cart, dtype=float),
-        orient_hint_cart=np.asarray(orient_hint_cart, dtype=float),
+        orient_hint_cart=orient_hint_cart,
         shape=shape,
         half_range=half_range,
     )
@@ -454,9 +484,8 @@ if __name__ == "__main__":
 
     n_in = input("Normal (Cartesian) [0 0 1]: ").strip()
     normal_cart = tuple(map(float, n_in.split())) if n_in else (0.0, 0.0, 1.0)
-
-    o_in = input("Orient hint (Cartesian) [1 0 0]: ").strip()
-    orient_hint = tuple(map(float, o_in.split())) if o_in else (1.0, 0.0, 0.0)
+    o_in = input("Orient hint (Cartesian) [Enter for auto: cross(normal, [1 0 0])]: ").strip()
+    orient_hint = tuple(map(float, o_in.split())) if o_in else None
 
     r_in = input("Half-range rx ry (A^-1) [1 1]: ").strip()
     half_range = tuple(map(float, r_in.split())) if r_in else (1.0, 1.0)
@@ -474,3 +503,4 @@ if __name__ == "__main__":
         shape=shape,
         show=True,
     )
+
