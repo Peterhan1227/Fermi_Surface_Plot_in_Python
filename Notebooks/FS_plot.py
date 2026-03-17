@@ -256,7 +256,7 @@ def _wrap_triangles_in_frac_cell(k_frac, faces, lattice, center=0.5):
     We choose one lattice translation per triangle from its center, then apply that
     translation to all three triangle vertices.
     """
-    tri_frac = k_frac[faces]  # (Nf,3,3)
+    tri_frac = k_frac[faces]
     tri_centers = tri_frac.mean(axis=1)
     tri_centers_wrapped = lattice.wrap_frac(tri_centers, center=center)
     shifts = tri_centers - tri_centers_wrapped
@@ -341,7 +341,7 @@ def plot_fermi_surface(
     ymin, ymax = ax.get_ylim3d()
     zmin, zmax = ax.get_zlim3d()
     ax.set_box_aspect((xmax - xmin, ymax - ymin, zmax - zmin))
-    ax.set_proj_type("ortho")  # optional, better for geometry comparison
+    ax.set_proj_type("ortho")
     plt.show()
 
 
@@ -349,7 +349,10 @@ if __name__ == "__main__":
     path = input("Path to .bxsf file: ").strip()
     lat_type = input("Lattice type (cubic/hexagonal/tetragonal): ").strip().lower() or "cubic"
     default_points = Path(path).resolve().parent / "HIGH_SYMMETRY_POINTS"
-    msg = f"Path to HIGH_SYMMETRY_POINTS [{default_points}]: " if default_points.exists() else "Path to HIGH_SYMMETRY_POINTS [optional]: "
+    if default_points.exists():
+        msg = f"Path to HIGH_SYMMETRY_POINTS [{default_points}]: "
+    else:
+        msg = "Path to HIGH_SYMMETRY_POINTS [optional]: "
     points_input = input(msg).strip()
     points_file = points_input or (str(default_points) if default_points.exists() else None)
 

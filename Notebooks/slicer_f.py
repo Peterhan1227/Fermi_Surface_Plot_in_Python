@@ -18,33 +18,27 @@ import matplotlib.pyplot as plt
 import numpy as np
 from skimage.measure import marching_cubes
 
-# Make local package imports work when running this script directly.
 repo_src = Path(__file__).resolve().parents[1] / "src"
 if str(repo_src) not in sys.path:
     sys.path.insert(0, str(repo_src))
 
-# --- imports (work in your repo OR in this sandbox) ---
 try:
-    from BZPlotter.coord import ReciprocalLattice  # your repo style
+    from BZPlotter.coord import ReciprocalLattice
 except Exception:  # pragma: no cover
     try:
-        from coord import ReciprocalLattice  # local sandbox style
+        from coord import ReciprocalLattice
     except Exception as e:
         raise ImportError("Could not import ReciprocalLattice (BZPlotter.coord or coord)") from e
 
 
 try:
-    from BZPlotter.plane import PlaneSpec, plane_grid  # your repo style
+    from BZPlotter.plane import PlaneSpec, plane_grid
 except Exception:  # pragma: no cover
     try:
-        from plane import PlaneSpec, plane_grid  # local sandbox style
+        from plane import PlaneSpec, plane_grid
     except Exception as e:
         raise ImportError("Could not import PlaneSpec/plane_grid (BZPlotter.plane or plane)") from e
 
-
-# -------------------------
-# Reading BXSF
-# -------------------------
 
 def read_bxsf(filename: str) -> dict:
     data = {
@@ -109,10 +103,6 @@ def _grid_period_lengths(grid: np.ndarray, tol=1e-8) -> np.ndarray:
     return np.asarray(periods, dtype=float)
 
 
-# -------------------------
-# WS BZ wireframe helpers (from fermi_bxsf_3)
-# -------------------------
-
 def _lattice_translations(lattice: ReciprocalLattice, nmax=2, include_zero=True):
     nset = np.array(list(product(range(-nmax, nmax + 1), repeat=3)), dtype=float)
     if not include_zero:
@@ -127,7 +117,6 @@ def _ws_normals(lattice: ReciprocalLattice, nmax=2):
 
 
 def fold_to_wigner_seitz(kpts: np.ndarray, lattice: ReciprocalLattice, nmax=2) -> np.ndarray:
-    """Fold points into first WS cell by nearest reciprocal-lattice translation."""
     g_vectors = _lattice_translations(lattice, nmax=nmax, include_zero=True)
     disp = kpts[:, None, :] - g_vectors[None, :, :]
     idx = np.argmin(np.sum(disp**2, axis=2), axis=1)
@@ -135,7 +124,6 @@ def fold_to_wigner_seitz(kpts: np.ndarray, lattice: ReciprocalLattice, nmax=2) -
 
 
 def _ws_vertex_mask(kpts: np.ndarray, lattice: ReciprocalLattice, nmax=2, tol=1e-10) -> np.ndarray:
-    """Mask of points inside first WS cell around Gamma."""
     g = _ws_normals(lattice, nmax=nmax)
     rhs = 0.5 * np.sum(g * g, axis=1) + tol
     return np.all(np.abs(kpts @ g.T) <= rhs[None, :], axis=1)
@@ -144,10 +132,7 @@ def _ws_vertex_mask(kpts: np.ndarray, lattice: ReciprocalLattice, nmax=2, tol=1e
 def _wrap_triangles_in_frac_cell(
     k_frac: np.ndarray, faces: np.ndarray, lattice: ReciprocalLattice, center=0.5
 ):
-    """
-    Wrap triangles coherently into one periodic image to avoid seam-spanning faces.
-    """
-    tri_frac = k_frac[faces]  # (Nf,3,3)
+    tri_frac = k_frac[faces]
     tri_centers = tri_frac.mean(axis=1)
     tri_centers_wrapped = lattice.wrap_frac(tri_centers, center=center)
     shifts = tri_centers - tri_centers_wrapped
@@ -191,10 +176,6 @@ def draw_bz_boundary(ax, lattice: ReciprocalLattice, nmax=2):
     for p0, p1 in _ws_polyhedron_edges(lattice, nmax=nmax):
         ax.plot3D(*zip(p0, p1), color="black", lw=1.3, alpha=0.8)
 
-
-# -------------------------
-# 3D Fermi surface plot
-# -------------------------
 
 def plot_fermi_surface(
     data: dict,
@@ -259,19 +240,12 @@ def plot_fermi_surface(
     ymin, ymax = ax.get_ylim3d()
     zmin, zmax = ax.get_zlim3d()
     ax.set_box_aspect((xmax - xmin, ymax - ymin, zmax - zmin))
-    ax.set_proj_type("ortho")  # optional, better for geometry comparison
+    ax.set_proj_type("ortho")
     plt.show()
 
 
-# -------------------------
-# Plane grid + trilinear interpolation on periodic BXSF grid
-# -------------------------
-
 def interp_trilinear_periodic(grid: np.ndarray, xyz: np.ndarray) -> np.ndarray:
-    """Trilinear interpolation for points in index coordinates (x,y,z).
-
-    Uses the detected periodicity of the BXSF grid along each axis.
-    """
+    """Trilinear interpolation for points in index coordinates (x,y,z)."""
     px, py, pz = _grid_period_lengths(grid).astype(int)
 
     x = xyz[:, 0]
@@ -307,11 +281,10 @@ def interp_trilinear_periodic(grid: np.ndarray, xyz: np.ndarray) -> np.ndarray:
     c0 = c00 * (1 - ty) + c10 * ty
     c1 = c01 * (1 - ty) + c11 * ty
 
-
     return c0 * (1 - tz) + c1 * tz
 
+
 def _default_orient_hint_from_normal(normal_cart: np.ndarray) -> np.ndarray:
-    """Build a perpendicular orient_hint from cross(normal, [1,0,0])."""
     n = np.asarray(normal_cart, dtype=float).reshape(3)
     n_norm = np.linalg.norm(n)
     if n_norm < 1e-12:
@@ -325,6 +298,7 @@ def _default_orient_hint_from_normal(normal_cart: np.ndarray) -> np.ndarray:
         hint = np.cross(n, ey)
     return hint
 
+
 def energies_on_plane_from_bxsf(
     data: dict,
     band_idx: int,
@@ -335,7 +309,6 @@ def energies_on_plane_from_bxsf(
     shape=(401, 401),
     half_range=(1.0, 1.0),
 ):
-    """Return (S,T,E2d,u,v,n,lattice) where E2d has shape (Ny,Nx)."""
     grid = data["band_data"][band_idx]
     lattice = ReciprocalLattice.from_B(np.array(data["vectors"], dtype=float).T)
     periods = _grid_period_lengths(grid)
@@ -364,10 +337,9 @@ def energies_on_plane_from_bxsf(
 
     pts, S, T, u, v, n = plane_grid(spec, return_mesh=True, return_basis=True)
 
-    # Cartesian k -> grid-fractional coordinates in the BXSF data cell.
     origin = np.asarray(data.get("origin", (0.0, 0.0, 0.0)), dtype=float).reshape(3)
     frac = lattice.cart_to_frac(pts) - origin
-    frac = frac - np.floor(frac)  # wrap to [0,1) for periodic interpolation
+    frac = frac - np.floor(frac)
 
     xyz = np.column_stack([
         frac[:, 0] * periods[0],
@@ -380,12 +352,7 @@ def energies_on_plane_from_bxsf(
     return S, T, E2d, u, v, n, lattice
 
 
-# -------------------------
-# Area + frequency
-# -------------------------
-
 def polygon_area(xy: np.ndarray) -> float:
-    """Shoelace area for a closed polygon given by points (N,2)."""
     if len(xy) < 3:
         return 0.0
     x = xy[:, 0]
@@ -394,11 +361,9 @@ def polygon_area(xy: np.ndarray) -> float:
 
 
 def contour_areas(S: np.ndarray, T: np.ndarray, E2d: np.ndarray, level: float):
-    """Return list of areas (in plane coords, i.e. A^-2) for closed E=level contours."""
     cs = plt.contour(S, T, E2d, levels=[level])
     areas = []
 
-    # Matplotlib compatibility: prefer allsegs (newer), fallback to collections (older).
     if hasattr(cs, "allsegs") and cs.allsegs:
         for seg in cs.allsegs[0]:
             v = np.asarray(seg)
@@ -420,17 +385,13 @@ def contour_areas(S: np.ndarray, T: np.ndarray, E2d: np.ndarray, level: float):
     plt.close()
     return areas
 
+
 def area_to_frequency_T(area_Ainv2: float) -> float:
-    """Onsager relation: F = (hbar / (2*pi*e)) * A."""
-    hbar = 1.054_571_817e-34  # J*s
-    e = 1.602_176_634e-19     # C
+    hbar = 1.054_571_817e-34
+    e = 1.602_176_634e-19
     area_m2inv = area_Ainv2 * 1e20
     return (hbar / (2 * np.pi * e)) * area_m2inv
 
-
-# -------------------------
-# User-facing workflow
-# -------------------------
 
 def slice_and_dhva(
     data: dict,
@@ -499,10 +460,6 @@ def sweep_slices_and_dhva_max(
     show_best_contour=True,
     show_A_vs_t=True,
 ):
-    """
-    Sweep parallel planes along the normal direction and find the slice
-    with the largest closed E=E_F contour area.
-    """
     ef = float(data["fermi_energy"])
     lattice = ReciprocalLattice.from_B(np.array(data["vectors"], dtype=float).T)
 
@@ -541,7 +498,7 @@ def sweep_slices_and_dhva_max(
         "freq_T": 0.0,
         "n_contours": 0,
     }
-    A_of_t = []  # (t0, max_area, n_contours)
+    A_of_t = []
 
     for t0 in t_vals:
         center_cart = center_cart0 + t0 * n_hat
@@ -651,7 +608,6 @@ if __name__ == "__main__":
     if do3d:
         plot_fermi_surface(data, band)
 
-    # Plane inputs (keep it simple, defaults work)
     c_in = input("Center (fractional b1 b2 b3) [0 0 0]: ").strip()
     center_frac = tuple(map(float, c_in.split())) if c_in else (0.0, 0.0, 0.0)
 
