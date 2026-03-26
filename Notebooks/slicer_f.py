@@ -103,6 +103,24 @@ def _grid_period_lengths(grid: np.ndarray, tol=1e-8) -> np.ndarray:
     return np.asarray(periods, dtype=float)
 
 
+def _periodic_supercell_triangles(
+    grid: np.ndarray,
+    level: float,
+    lattice: ReciprocalLattice,
+    origin: np.ndarray,
+    shift: np.ndarray,
+    reps=(3, 3, 3),
+):
+    """Build periodic isosurface triangles in Cartesian coordinates."""
+    periods = _grid_period_lengths(grid).astype(int)
+    core = np.asarray(grid)[tuple(slice(0, p) for p in periods)]
+    tiled = np.tile(core, reps)
+    verts, faces, _, _ = marching_cubes(tiled, level)
+    frac = verts / periods[None, :] - (np.asarray(reps, dtype=float) // 2)[None, :]
+    verts_cart = lattice.frac_to_cart(origin + frac + shift)
+    return verts_cart[faces]
+
+
 def _lattice_translations(lattice: ReciprocalLattice, nmax=2, include_zero=True):
     nset = np.array(list(product(range(-nmax, nmax + 1), repeat=3)), dtype=float)
     if not include_zero:
@@ -127,6 +145,85 @@ def _ws_vertex_mask(kpts: np.ndarray, lattice: ReciprocalLattice, nmax=2, tol=1e
     g = _ws_normals(lattice, nmax=nmax)
     rhs = 0.5 * np.sum(g * g, axis=1) + tol
     return np.all(np.abs(kpts @ g.T) <= rhs[None, :], axis=1)
+
+
+def _compact_polygon_vertices(poly: np.ndarray, tol=1e-10) -> np.ndarray:
+    """Drop duplicate consecutive vertices introduced during clipping."""
+    if len(poly) == 0:
+        return poly
+
+    out = [poly[0]]
+    for pt in poly[1:]:
+        if np.linalg.norm(pt - out[-1]) > tol:
+            out.append(pt)
+
+    if len(out) > 1 and np.linalg.norm(out[0] - out[-1]) <= tol:
+        out.pop()
+    return np.asarray(out, dtype=float)
+
+
+def _clip_polygon_to_halfspace(
+    poly: np.ndarray, normal: np.ndarray, bound: float, tol=1e-10
+) -> np.ndarray:
+    """Clip a polygon against one WS half-space normal.x <= bound."""
+    if len(poly) == 0:
+        return poly
+
+    out = []
+    prev = poly[-1]
+    prev_val = np.dot(normal, prev) - bound
+    prev_in = prev_val <= tol
+
+    for curr in poly:
+        curr_val = np.dot(normal, curr) - bound
+        curr_in = curr_val <= tol
+
+        if curr_in != prev_in:
+            denom = prev_val - curr_val
+            if abs(denom) > tol:
+                t = prev_val / denom
+                out.append(prev + t * (curr - prev))
+
+        if curr_in:
+            out.append(curr)
+
+        prev = curr
+        prev_val = curr_val
+        prev_in = curr_in
+
+    if not out:
+        return np.empty((0, 3), dtype=float)
+    return _compact_polygon_vertices(np.asarray(out, dtype=float), tol=tol)
+
+
+def _clip_triangles_to_ws(
+    triangles: np.ndarray, lattice: ReciprocalLattice, nmax=2, tol=1e-10
+):
+    """Clip periodic triangles to the WS cell without creating a seam."""
+    normals = _ws_normals(lattice, nmax=nmax)
+    bvals = 0.5 * np.sum(normals * normals, axis=1)
+
+    clipped = []
+    for tri in triangles:
+        poly = np.asarray(tri, dtype=float)
+        for normal, bound in zip(normals, bvals):
+            poly = _clip_polygon_to_halfspace(poly, normal, bound, tol=tol)
+            if len(poly) < 3:
+                break
+
+        if len(poly) < 3:
+            continue
+
+        anchor = poly[0]
+        for i in range(1, len(poly) - 1):
+            clipped.append(np.vstack([anchor, poly[i], poly[i + 1]]))
+
+    if not clipped:
+        return np.empty((0, 3), dtype=float), np.empty((0, 3), dtype=int)
+
+    verts = np.asarray(clipped, dtype=float).reshape(-1, 3)
+    faces = np.arange(len(verts), dtype=int).reshape(-1, 3)
+    return verts, faces
 
 
 def _wrap_triangles_in_frac_cell(
@@ -177,6 +274,53 @@ def draw_bz_boundary(ax, lattice: ReciprocalLattice, nmax=2):
         ax.plot3D(*zip(p0, p1), color="black", lw=1.3, alpha=0.8)
 
 
+def _project_to_plane_coords(
+    pts: np.ndarray, center_cart: np.ndarray, u: np.ndarray, v: np.ndarray
+) -> np.ndarray:
+    rel = np.asarray(pts, dtype=float) - np.asarray(center_cart, dtype=float)
+    return np.column_stack([rel @ u, rel @ v])
+
+
+def _ws_slice_polygon(
+    lattice: ReciprocalLattice,
+    center_cart: np.ndarray,
+    u: np.ndarray,
+    v: np.ndarray,
+    n_hat: np.ndarray,
+    nmax=2,
+    tol=1e-9,
+) -> np.ndarray | None:
+    """Return the WS-cell cross-section polygon in the slice (s,t) coordinates."""
+    pts = []
+    center_cart = np.asarray(center_cart, dtype=float).reshape(3)
+    n_hat = np.asarray(n_hat, dtype=float).reshape(3)
+
+    for p0, p1 in _ws_polyhedron_edges(lattice, nmax=nmax):
+        d0 = float(np.dot(n_hat, p0 - center_cart))
+        d1 = float(np.dot(n_hat, p1 - center_cart))
+
+        if abs(d0) <= tol:
+            pts.append(p0)
+        if abs(d1) <= tol:
+            pts.append(p1)
+        if d0 * d1 < -tol * tol:
+            t = d0 / (d0 - d1)
+            pts.append(p0 + t * (p1 - p0))
+
+    if not pts:
+        return None
+
+    pts = np.unique(np.round(np.asarray(pts, dtype=float), 10), axis=0)
+    if len(pts) < 3:
+        return None
+
+    st = _project_to_plane_coords(pts, center_cart, u, v)
+    ctr = st.mean(axis=0)
+    ang = np.arctan2(st[:, 1] - ctr[1], st[:, 0] - ctr[0])
+    order = np.argsort(ang)
+    return st[order]
+
+
 def plot_fermi_surface(
     data: dict,
     band_idx: int,
@@ -184,41 +328,25 @@ def plot_fermi_surface(
 ):
     ef = data["fermi_energy"]
     grid = data["band_data"][band_idx]
-    nx, ny, nz = data["grid_dimensions"]
     lattice = ReciprocalLattice.from_B(np.array(data["vectors"], dtype=float).T)
 
-    verts, faces, _, _ = marching_cubes(grid, ef)
-
-    frac_grid = np.column_stack(
-        [
-            verts[:, 0] / (nx - 1),
-            verts[:, 1] / (ny - 1),
-            verts[:, 2] / (nz - 1),
-        ]
-    )
-
     origin = np.asarray(data.get("origin", (0.0, 0.0, 0.0)), dtype=float).reshape(3)
-    k_frac = origin + frac_grid
-    verts_base, faces_base = _wrap_triangles_in_frac_cell(
-        k_frac, faces, lattice, center=0.5
-    )
+    shift = np.zeros(3, dtype=float)
 
-    verts_plot = verts_base
-    faces_plot = faces_base
     if fold_ws:
-        tri = verts_base[faces_base]
-        centers = tri.mean(axis=1)
-        centers_folded = fold_to_wigner_seitz(centers, lattice, nmax=2)
-        shifts = centers - centers_folded
-        tri_folded = tri - shifts[:, None, :]
+        tri_super = _periodic_supercell_triangles(grid, ef, lattice, origin, shift)
+        verts_plot, faces_plot = _clip_triangles_to_ws(tri_super, lattice, nmax=2)
+    else:
+        periods = _grid_period_lengths(grid)
+        verts, faces, _, _ = marching_cubes(grid, ef)
+        frac_grid = verts / periods[None, :]
+        k_frac = origin + frac_grid
+        verts_plot, faces_plot = _wrap_triangles_in_frac_cell(
+            k_frac, faces, lattice, center=0.5
+        )
 
-        tri_points = tri_folded.reshape(-1, 3)
-        in_ws = _ws_vertex_mask(tri_points, lattice, nmax=2).reshape(-1, 3)
-        keep = np.all(in_ws, axis=1)
-        tri_keep = tri_folded[keep]
-        if len(tri_keep) > 0:
-            verts_plot = tri_keep.reshape(-1, 3)
-            faces_plot = np.arange(len(verts_plot), dtype=int).reshape(-1, 3)
+    if len(faces_plot) == 0:
+        raise ValueError("No Fermi-surface triangles remain after WS clipping.")
 
     fig = plt.figure(figsize=(10, 8))
     ax = fig.add_subplot(111, projection="3d")
@@ -360,30 +488,88 @@ def polygon_area(xy: np.ndarray) -> float:
     return 0.5 * abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1)))
 
 
-def contour_areas(S: np.ndarray, T: np.ndarray, E2d: np.ndarray, level: float):
-    cs = plt.contour(S, T, E2d, levels=[level])
-    areas = []
+def contour_segments(
+    S: np.ndarray, T: np.ndarray, E2d: np.ndarray, level: float, close_tol=1e-10
+):
+    fig, ax = plt.subplots()
+    cs = ax.contour(S, T, E2d, levels=[level])
+    segments = []
 
     if hasattr(cs, "allsegs") and cs.allsegs:
         for seg in cs.allsegs[0]:
             v = np.asarray(seg)
             if len(v) < 3:
                 continue
-            if np.linalg.norm(v[0] - v[-1]) > 1e-10:
-                v = np.vstack([v, v[0]])
-            areas.append(polygon_area(v[:-1]))
+            closed = np.linalg.norm(v[0] - v[-1]) <= close_tol
+            if closed:
+                v = v[:-1]
+            segments.append((v, closed))
     else:
         for coll in getattr(cs, "collections", []):
             for p in coll.get_paths():
-                v = p.vertices
+                v = np.asarray(p.vertices)
                 if len(v) < 3:
                     continue
-                if np.linalg.norm(v[0] - v[-1]) > 1e-10:
-                    v = np.vstack([v, v[0]])
-                areas.append(polygon_area(v[:-1]))
+                closed = np.linalg.norm(v[0] - v[-1]) <= close_tol
+                if closed:
+                    v = v[:-1]
+                segments.append((v, closed))
 
-    plt.close()
+    plt.close(fig)
+    return segments
+
+
+def contour_areas(S: np.ndarray, T: np.ndarray, E2d: np.ndarray, level: float):
+    areas = []
+    for v, closed in contour_segments(S, T, E2d, level):
+        if not closed or len(v) < 3:
+            continue
+        areas.append(polygon_area(v))
     return areas
+
+
+def _plot_slice_contours(
+    S: np.ndarray,
+    T: np.ndarray,
+    E2d: np.ndarray,
+    level: float,
+    *,
+    center_cart: np.ndarray,
+    u: np.ndarray,
+    v: np.ndarray,
+    n_hat: np.ndarray,
+    lattice: ReciprocalLattice,
+    title: str,
+):
+    segments = contour_segments(S, T, E2d, level)
+    ws_poly = _ws_slice_polygon(lattice, center_cart, u, v, n_hat, nmax=2)
+    n_closed = sum(int(closed) for _, closed in segments)
+    n_open = len(segments) - n_closed
+
+    plt.figure(figsize=(7, 6))
+    for seg, closed in segments:
+        if len(seg) < 2:
+            continue
+        plt.plot(
+            seg[:, 0],
+            seg[:, 1],
+            color=("C0" if closed else "C1"),
+            ls=("-" if closed else "--"),
+            lw=1.5,
+        )
+
+    if ws_poly is not None:
+        poly = np.vstack([ws_poly, ws_poly[0]])
+        plt.plot(poly[:, 0], poly[:, 1], color="black", lw=1.2)
+
+    plt.gca().set_aspect("equal", adjustable="box")
+    plt.title(f"{title}\nclosed={n_closed}, open={n_open}")
+    plt.xlabel("s (A^-1)")
+    plt.ylabel("t (A^-1)")
+    plt.tight_layout()
+    plt.show()
+
+    return segments, n_closed, n_open
 
 
 def area_to_frequency_T(area_Ainv2: float) -> float:
@@ -405,15 +591,15 @@ def slice_and_dhva(
     show=True,
 ):
     ef = float(data["fermi_energy"])
+    normal_arr = np.asarray(normal_cart, dtype=float)
     lattice = ReciprocalLattice.from_B(np.array(data["vectors"], dtype=float).T)
-
     center_cart = lattice.frac_to_cart(np.asarray(center_frac, dtype=float))
 
-    S, T, E2d, *_ = energies_on_plane_from_bxsf(
+    S, T, E2d, u, v, n_hat, _ = energies_on_plane_from_bxsf(
         data,
         band_idx,
         center_cart=center_cart,
-        normal_cart=np.asarray(normal_cart, dtype=float),
+        normal_cart=normal_arr,
         orient_hint_cart=orient_hint_cart,
         shape=shape,
         half_range=half_range,
@@ -424,22 +610,28 @@ def slice_and_dhva(
     freqs = [area_to_frequency_T(a) for a in areas]
 
     if show:
-        plt.figure(figsize=(7, 6))
-        plt.contour(S, T, E2d, levels=[ef])
-        plt.gca().set_aspect("equal", adjustable="box")
-        plt.title(f"Band {band_idx} slice: E=E_F contours\nnormal ~ {np.asarray(normal_cart)}")
-        plt.xlabel("s (A^-1)")
-        plt.ylabel("t (A^-1)")
-        plt.show()
+        _, n_closed, n_open = _plot_slice_contours(
+            S,
+            T,
+            E2d,
+            ef,
+            center_cart=center_cart,
+            u=u,
+            v=v,
+            n_hat=n_hat,
+            lattice=lattice,
+            title=f"Band {band_idx} slice: E=E_F contours\nnormal ~ {normal_arr}",
+        )
 
         if areas:
             a0 = areas[0]
             f0 = freqs[0]
-            print(f"Contours found: {len(areas)}")
+            print(f"Closed contours found: {n_closed}")
+            print(f"Open contour fragments: {n_open}")
             print(f"Largest area: {a0:.6g} A^-2")
             print(f"Frequency:    {f0:.6g} T  ({f0/1e3:.6g} kT)")
         else:
-            print("No closed E=E_F contours found on this slice.")
+            print(f"No closed E=E_F contours found on this slice. Open fragments: {n_open}")
 
     return areas, freqs
 
@@ -545,7 +737,7 @@ def sweep_slices_and_dhva_max(
 
     if show_best_contour and best["t0"] is not None:
         center_cart_best = best["center_cart"]
-        S, T, E2d, *_ = energies_on_plane_from_bxsf(
+        S, T, E2d, u, v, n_best, _ = energies_on_plane_from_bxsf(
             data,
             band_idx,
             center_cart=center_cart_best,
@@ -555,17 +747,21 @@ def sweep_slices_and_dhva_max(
             half_range=half_range,
         )
 
-        plt.figure(figsize=(7, 6))
-        plt.contour(S, T, E2d, levels=[ef])
-        plt.gca().set_aspect("equal", adjustable="box")
-        plt.title(
-            f"Best slice (t0={best['t0']:.6g}): E=E_F contours\n"
-            f"Amax={best['area_Ainv2']:.6g} A^-2, F={best['freq_T']:.6g} T"
+        _, n_closed, n_open = _plot_slice_contours(
+            S,
+            T,
+            E2d,
+            ef,
+            center_cart=center_cart_best,
+            u=u,
+            v=v,
+            n_hat=n_best,
+            lattice=lattice,
+            title=(
+                f"Best slice (t0={best['t0']:.6g}): E=E_F contours\n"
+                f"Amax={best['area_Ainv2']:.6g} A^-2, F={best['freq_T']:.6g} T"
+            ),
         )
-        plt.xlabel("s (A^-1)")
-        plt.ylabel("t (A^-1)")
-        plt.tight_layout()
-        plt.show()
 
     if best["t0"] is None:
         print("No closed E=E_F contours found on any slice in the sweep.")
