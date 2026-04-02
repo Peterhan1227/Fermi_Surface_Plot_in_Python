@@ -4,6 +4,7 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
+from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 from skimage.measure import marching_cubes
 
 repo_src = Path(__file__).resolve().parents[1] / "src"
@@ -243,8 +244,59 @@ def _ws_polyhedron_edges(lattice, nmax=3, tol=1e-9):
     return edges
 
 
+def _ws_polyhedron_faces(lattice, nmax=3, tol=1e-9):
+    """Build WS-cell polygon faces for translucent boundary rendering."""
+    normals = _ws_normals(lattice, nmax=nmax)
+    bvals = 0.5 * np.sum(normals * normals, axis=1)
+
+    vertices = []
+    for i, j, k in combinations(range(len(normals)), 3):
+        a = np.vstack([normals[i], normals[j], normals[k]])
+        if abs(np.linalg.det(a)) < 1e-10:
+            continue
+        x = np.linalg.solve(a, np.array([bvals[i], bvals[j], bvals[k]]))
+        if np.all(normals @ x <= bvals + tol):
+            vertices.append(x)
+
+    if not vertices:
+        return []
+
+    verts = np.unique(np.round(np.asarray(vertices), 10), axis=0)
+    faces = []
+    for normal, bound in zip(normals, bvals):
+        mask = np.isclose(verts @ normal, bound, atol=5e-7, rtol=0.0)
+        face = verts[mask]
+        if len(face) < 3:
+            continue
+
+        center = face.mean(axis=0)
+        n_hat = normal / np.linalg.norm(normal)
+        ref = np.array([1.0, 0.0, 0.0], dtype=float)
+        if abs(np.dot(ref, n_hat)) > 0.9:
+            ref = np.array([0.0, 1.0, 0.0], dtype=float)
+        u = np.cross(n_hat, ref)
+        u /= np.linalg.norm(u)
+        v = np.cross(n_hat, u)
+
+        rel = face - center
+        angles = np.arctan2(rel @ v, rel @ u)
+        ordered = face[np.argsort(angles)]
+        faces.append(ordered)
+
+    return faces
+
+
 def draw_bz_boundary(ax, lattice, nmax=3):
     """Draw first Brillouin-zone boundary from WS construction."""
+    faces = _ws_polyhedron_faces(lattice, nmax=nmax)
+    if faces:
+        ws_fill = Poly3DCollection(
+            faces,
+            facecolors=(0.72, 0.80, 0.92, 0.18),
+            edgecolors="none",
+        )
+        ax.add_collection3d(ws_fill)
+
     for p0, p1 in _ws_polyhedron_edges(lattice, nmax=nmax):
         ax.plot3D(*zip(p0, p1), color="black", lw=1.3, alpha=0.8)
 

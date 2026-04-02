@@ -1,11 +1,12 @@
-"""BXSF -> Fermi-surface plot + planar cross-section area -> dHvA frequency.
+"""BXSF -> periodic slice contours -> dHvA frequency.
 
 Workflow:
 - Read .bxsf (VASPKIT) band energy grids
 - (Optional) Plot 3D Fermi surface (marching cubes)
 - Define a plane (normal ~ B-field direction)
 - Interpolate E(k) from the 3D grid onto a 2D plane grid
-- Extract E=E_F contours, compute enclosed areas, convert to dHvA frequencies
+- Reconstruct periodic E=E_F contours on an enlarged in-plane window
+- Compute enclosed areas and convert them to dHvA frequencies
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.path import Path as MplPath
 from skimage.measure import marching_cubes
 
 repo_src = Path(__file__).resolve().parents[1] / "src"
@@ -515,48 +517,290 @@ def contour_areas(S: np.ndarray, T: np.ndarray, E2d: np.ndarray, level: float):
     return areas
 
 
+def _normalize_supercell(supercell) -> tuple[int, int]:
+    if np.isscalar(supercell):
+        sx = sy = int(supercell)
+    else:
+        sx, sy = (int(v) for v in supercell)
+    if sx < 1 or sy < 1:
+        raise ValueError("supercell entries must be >= 1.")
+    return sx, sy
+
+
+def _superplane_shape(shape, supercell) -> tuple[int, int]:
+    nx, ny = (int(v) for v in shape)
+    if nx < 2 or ny < 2:
+        raise ValueError("shape entries must be >= 2.")
+    sx, sy = _normalize_supercell(supercell)
+    return sx * (nx - 1) + 1, sy * (ny - 1) + 1
+
+
+def _superplane_half_range(half_range, supercell) -> tuple[float, float]:
+    rx, ry = (float(v) for v in half_range)
+    sx, sy = _normalize_supercell(supercell)
+    return sx * rx, sy * ry
+
+
+def _central_box_vertices(half_range) -> np.ndarray:
+    rx, ry = (float(v) for v in half_range)
+    return np.array([[-rx, -ry], [rx, -ry], [rx, ry], [-rx, ry]], dtype=float)
+
+
+def _cross2d(a: np.ndarray, b: np.ndarray) -> float:
+    return float(a[0] * b[1] - a[1] * b[0])
+
+
+def _point_on_segment(p, a, b, tol=1e-10) -> bool:
+    p = np.asarray(p, dtype=float)
+    a = np.asarray(a, dtype=float)
+    b = np.asarray(b, dtype=float)
+    ab = b - a
+    ap = p - a
+    cross = _cross2d(ab, ap)
+    if abs(cross) > tol:
+        return False
+    dot = float(np.dot(ap, ab))
+    if dot < -tol:
+        return False
+    if dot - float(np.dot(ab, ab)) > tol:
+        return False
+    return True
+
+
+def _segments_intersect(a0, a1, b0, b1, tol=1e-10) -> bool:
+    a0 = np.asarray(a0, dtype=float)
+    a1 = np.asarray(a1, dtype=float)
+    b0 = np.asarray(b0, dtype=float)
+    b1 = np.asarray(b1, dtype=float)
+
+    def orient(p, q, r) -> float:
+        return _cross2d(q - p, r - p)
+
+    o1 = orient(a0, a1, b0)
+    o2 = orient(a0, a1, b1)
+    o3 = orient(b0, b1, a0)
+    o4 = orient(b0, b1, a1)
+
+    if (
+        ((o1 > tol and o2 < -tol) or (o1 < -tol and o2 > tol))
+        and ((o3 > tol and o4 < -tol) or (o3 < -tol and o4 > tol))
+    ):
+        return True
+
+    if abs(o1) <= tol and _point_on_segment(b0, a0, a1, tol=tol):
+        return True
+    if abs(o2) <= tol and _point_on_segment(b1, a0, a1, tol=tol):
+        return True
+    if abs(o3) <= tol and _point_on_segment(a0, b0, b1, tol=tol):
+        return True
+    if abs(o4) <= tol and _point_on_segment(a1, b0, b1, tol=tol):
+        return True
+
+    return False
+
+
+def _polygon_intersects_box(poly: np.ndarray, half_range, tol=1e-10) -> bool:
+    poly = np.asarray(poly, dtype=float)
+    if len(poly) < 3:
+        return False
+
+    rx, ry = (float(v) for v in half_range)
+    in_box = (
+        (poly[:, 0] >= -rx - tol)
+        & (poly[:, 0] <= rx + tol)
+        & (poly[:, 1] >= -ry - tol)
+        & (poly[:, 1] <= ry + tol)
+    )
+    if np.any(in_box):
+        return True
+
+    rect = _central_box_vertices(half_range)
+    path = MplPath(poly, closed=True)
+    if np.any(path.contains_points(rect, radius=tol)):
+        return True
+
+    rect_closed = np.vstack([rect, rect[0]])
+    poly_closed = np.vstack([poly, poly[0]])
+    for i in range(len(poly)):
+        a0, a1 = poly_closed[i], poly_closed[i + 1]
+        for j in range(4):
+            b0, b1 = rect_closed[j], rect_closed[j + 1]
+            if _segments_intersect(a0, a1, b0, b1, tol=tol):
+                return True
+
+    return False
+
+
+def _polygon_intersects_polygon(poly_a: np.ndarray, poly_b: np.ndarray, tol=1e-10) -> bool:
+    poly_a = np.asarray(poly_a, dtype=float)
+    poly_b = np.asarray(poly_b, dtype=float)
+    if len(poly_a) < 3 or len(poly_b) < 3:
+        return False
+
+    path_a = MplPath(poly_a, closed=True)
+    path_b = MplPath(poly_b, closed=True)
+    if np.any(path_a.contains_points(poly_b, radius=tol)):
+        return True
+    if np.any(path_b.contains_points(poly_a, radius=tol)):
+        return True
+
+    poly_a_closed = np.vstack([poly_a, poly_a[0]])
+    poly_b_closed = np.vstack([poly_b, poly_b[0]])
+    for i in range(len(poly_a)):
+        a0, a1 = poly_a_closed[i], poly_a_closed[i + 1]
+        for j in range(len(poly_b)):
+            b0, b1 = poly_b_closed[j], poly_b_closed[j + 1]
+            if _segments_intersect(a0, a1, b0, b1, tol=tol):
+                return True
+
+    return False
+
+
+def periodic_contour_segments(
+    data: dict,
+    band_idx: int,
+    center_cart: np.ndarray,
+    normal_cart: np.ndarray,
+    orient_hint_cart: np.ndarray | None = None,
+    *,
+    shape=(401, 401),
+    half_range=(1.0, 1.0),
+    level: float | None = None,
+    supercell=3,
+    close_tol=1e-10,
+):
+    """Recover closed contours by extracting them on an enlarged slice window."""
+    if level is None:
+        level = float(data["fermi_energy"])
+
+    super_shape = _superplane_shape(shape, supercell)
+    super_half_range = _superplane_half_range(half_range, supercell)
+
+    S, T, E2d, u, v, n_hat, lattice = energies_on_plane_from_bxsf(
+        data,
+        band_idx,
+        center_cart=center_cart,
+        normal_cart=normal_cart,
+        orient_hint_cart=orient_hint_cart,
+        shape=super_shape,
+        half_range=super_half_range,
+    )
+
+    ws_poly = _ws_slice_polygon(lattice, center_cart, u, v, n_hat, nmax=2)
+    raw_segments = contour_segments(S, T, E2d, level, close_tol=close_tol)
+    closed_selected = []
+    n_open_raw = 0
+    for seg, closed in raw_segments:
+        if not closed:
+            n_open_raw += 1
+            continue
+        if ws_poly is not None:
+            keep = _polygon_intersects_polygon(seg, ws_poly, tol=max(close_tol, 1e-9))
+        else:
+            keep = _polygon_intersects_box(seg, half_range, tol=max(close_tol, 1e-9))
+        if keep:
+            closed_selected.append(seg)
+
+    meta = {
+        "S": S,
+        "T": T,
+        "E2d": E2d,
+        "u": u,
+        "v": v,
+        "n_hat": n_hat,
+        "lattice": lattice,
+        "ws_poly": ws_poly,
+        "super_shape": super_shape,
+        "super_half_range": super_half_range,
+        "n_raw_segments": len(raw_segments),
+        "n_raw_closed": sum(int(closed) for _, closed in raw_segments),
+        "n_raw_open": n_open_raw,
+    }
+    return closed_selected, meta
+
+
+def periodic_contour_areas(
+    data: dict,
+    band_idx: int,
+    center_cart: np.ndarray,
+    normal_cart: np.ndarray,
+    orient_hint_cart: np.ndarray | None = None,
+    *,
+    shape=(401, 401),
+    half_range=(1.0, 1.0),
+    level: float | None = None,
+    supercell=3,
+    close_tol=1e-10,
+):
+    segments, meta = periodic_contour_segments(
+        data,
+        band_idx,
+        center_cart=center_cart,
+        normal_cart=normal_cart,
+        orient_hint_cart=orient_hint_cart,
+        shape=shape,
+        half_range=half_range,
+        level=level,
+        supercell=supercell,
+        close_tol=close_tol,
+    )
+    areas = [polygon_area(seg) for seg in segments if len(seg) >= 3]
+    return areas, segments, meta
+
+
 def _plot_slice_contours(
-    S: np.ndarray,
-    T: np.ndarray,
-    E2d: np.ndarray,
+    data: dict,
+    band_idx: int,
     level: float,
     *,
     center_cart: np.ndarray,
-    u: np.ndarray,
-    v: np.ndarray,
-    n_hat: np.ndarray,
-    lattice: ReciprocalLattice,
+    normal_cart: np.ndarray,
+    orient_hint_cart: np.ndarray | None,
+    shape=(401, 401),
+    half_range=(1.0, 1.0),
+    contour_supercell=3,
     title: str,
 ):
-    segments = contour_segments(S, T, E2d, level)
-    ws_poly = _ws_slice_polygon(lattice, center_cart, u, v, n_hat, nmax=2)
-    n_closed = sum(int(closed) for _, closed in segments)
-    n_open = len(segments) - n_closed
+    segments, meta = periodic_contour_segments(
+        data,
+        band_idx,
+        center_cart=center_cart,
+        normal_cart=normal_cart,
+        orient_hint_cart=orient_hint_cart,
+        shape=shape,
+        half_range=half_range,
+        level=level,
+        supercell=contour_supercell,
+    )
+
+    ws_poly = meta["ws_poly"]
 
     plt.figure(figsize=(7, 6))
-    for seg, closed in segments:
+    for seg in segments:
         if len(seg) < 2:
             continue
-        plt.plot(
-            seg[:, 0],
-            seg[:, 1],
-            color=("C0" if closed else "C1"),
-            ls=("-" if closed else "--"),
-            lw=1.5,
-        )
+        plt.plot(seg[:, 0], seg[:, 1], color="C0", lw=1.5)
 
     if ws_poly is not None:
         poly = np.vstack([ws_poly, ws_poly[0]])
         plt.plot(poly[:, 0], poly[:, 1], color="black", lw=1.2)
 
+    box = _central_box_vertices(half_range)
+    box = np.vstack([box, box[0]])
+    plt.plot(box[:, 0], box[:, 1], color="0.5", lw=1.0, ls="--")
+
+    sx, sy = _normalize_supercell(contour_supercell)
     plt.gca().set_aspect("equal", adjustable="box")
-    plt.title(f"{title}\nclosed={n_closed}, open={n_open}")
+    plt.title(
+        f"{title}\nclosed={len(segments)}, raw open={meta['n_raw_open']}, "
+        f"supercell={sx}x{sy}"
+    )
     plt.xlabel("s (A^-1)")
     plt.ylabel("t (A^-1)")
     plt.tight_layout()
     plt.show()
 
-    return segments, n_closed, n_open
+    return segments, len(segments), meta["n_raw_open"]
 
 
 def area_to_frequency_T(area_Ainv2: float) -> float:
@@ -581,6 +825,7 @@ def sweep_slices_and_dhva_max(
     force_include_t0=True,
     show_best_contour=True,
     show_A_vs_t=True,
+    contour_supercell=3,
 ):
     ef = float(data["fermi_energy"])
     lattice = ReciprocalLattice.from_B(np.array(data["vectors"], dtype=float).T)
@@ -608,9 +853,8 @@ def sweep_slices_and_dhva_max(
         "t0": None,
         "area_Ainv2": 0.0,
         "freq_T": 0.0,
-        "min_area_Ainv2": 0.0,
-        "min_freq_T": 0.0,
         "n_contours": 0,
+        "n_raw_open": 0,
         "center_cart": None,
         "center_frac": None,
         "areas_Ainv2": [],
@@ -621,12 +865,13 @@ def sweep_slices_and_dhva_max(
         "area_Ainv2": 0.0,
         "freq_T": 0.0,
         "n_contours": 0,
+        "n_raw_open": 0,
     }
     A_of_t = []
 
     for t0 in t_vals:
         center_cart = center_cart0 + t0 * n_hat
-        S, T, E2d, *_ = energies_on_plane_from_bxsf(
+        areas, _, meta = periodic_contour_areas(
             data,
             band_idx,
             center_cart=center_cart,
@@ -634,9 +879,11 @@ def sweep_slices_and_dhva_max(
             orient_hint_cart=orient_hint_cart,
             shape=shape,
             half_range=half_range,
+            level=ef,
+            supercell=contour_supercell,
         )
 
-        areas = sorted((a for a in contour_areas(S, T, E2d, ef) if a > 0.0), reverse=True)
+        areas = sorted((a for a in areas if a > 0.0), reverse=True)
         amax = float(areas[0]) if areas else 0.0
         A_of_t.append((float(t0), amax, float(len(areas))))
 
@@ -645,14 +892,14 @@ def sweep_slices_and_dhva_max(
             center_plane["area_Ainv2"] = amax
             center_plane["freq_T"] = float(area_to_frequency_T(amax)) if amax > 0.0 else 0.0
             center_plane["n_contours"] = int(len(areas))
+            center_plane["n_raw_open"] = int(meta["n_raw_open"])
 
         if areas and amax > best["area_Ainv2"]:
             best["t0"] = float(t0)
             best["area_Ainv2"] = amax
             best["freq_T"] = float(area_to_frequency_T(amax))
-            best["min_area_Ainv2"] = float(areas[-1])
-            best["min_freq_T"] = float(area_to_frequency_T(areas[-1]))
             best["n_contours"] = int(len(areas))
+            best["n_raw_open"] = int(meta["n_raw_open"])
             best["center_cart"] = center_cart
             best["center_frac"] = lattice.cart_to_frac(center_cart)
             best["areas_Ainv2"] = areas
@@ -670,27 +917,16 @@ def sweep_slices_and_dhva_max(
         plt.show()
 
     if show_best_contour and best["t0"] is not None:
-        center_cart_best = best["center_cart"]
-        S, T, E2d, u, v, n_best, _ = energies_on_plane_from_bxsf(
+        _plot_slice_contours(
             data,
             band_idx,
-            center_cart=center_cart_best,
+            ef,
+            center_cart=best["center_cart"],
             normal_cart=n_hat,
             orient_hint_cart=orient_hint_cart,
             shape=shape,
             half_range=half_range,
-        )
-
-        _, n_closed, n_open = _plot_slice_contours(
-            S,
-            T,
-            E2d,
-            ef,
-            center_cart=center_cart_best,
-            u=u,
-            v=v,
-            n_hat=n_best,
-            lattice=lattice,
+            contour_supercell=contour_supercell,
             title=(
                 f"Best slice (t0={best['t0']:.6g}): E=E_F contours\n"
                 f"Amax={best['area_Ainv2']:.6g} A^-2, F={best['freq_T']:.6g} T"
@@ -702,23 +938,22 @@ def sweep_slices_and_dhva_max(
     else:
         frac_str = np.array2string(best["center_frac"], precision=6, separator=", ")
         cart_str = np.array2string(best["center_cart"], precision=6, separator=", ")
+        sx, sy = _normalize_supercell(contour_supercell)
         print(f"Sweep complete: {len(t_vals)} slices")
+        print(f"Periodic contour supercell: {sx} x {sy}")
         print(f"Best offset t0: {best['t0']:.6g}")
         print(f"Best center (frac): {frac_str}")
         print(f"Best center (cart): {cart_str}")
         print(f"Max area: {best['area_Ainv2']:.6g} A^-2")
         print(f"Frequency: {best['freq_T']:.6g} T ({best['freq_T']/1e3:.6g} kT)")
-        print(f"Min non-zero area on best slice: {best['min_area_Ainv2']:.6g} A^-2")
-        print(
-            f"Min non-zero frequency on best slice: "
-            f"{best['min_freq_T']:.6g} T ({best['min_freq_T']/1e3:.6g} kT)"
-        )
         print(f"Contours on best slice: {best['n_contours']}")
+        print(f"Raw open fragments on best superplane: {best['n_raw_open']}")
         if center_plane["evaluated"]:
             print(
                 f"Center plane (t0=0): {center_plane['area_Ainv2']:.6g} A^-2, "
                 f"{center_plane['freq_T']:.6g} T, "
-                f"contours={center_plane['n_contours']}"
+                f"contours={center_plane['n_contours']}, "
+                f"raw_open={center_plane['n_raw_open']}"
             )
         print(
             "All contour areas on best slice (A^-2): "
@@ -757,6 +992,13 @@ if __name__ == "__main__":
     s_in = input("Grid Nx Ny [401 401]: ").strip()
     shape = tuple(map(int, s_in.split())) if s_in else (401, 401)
 
+    sc_in = input("Contour supercell sx sy [3 3]: ").strip()
+    if sc_in:
+        sc_vals = tuple(map(int, sc_in.split()))
+        contour_supercell = sc_vals[0] if len(sc_vals) == 1 else sc_vals
+    else:
+        contour_supercell = (3, 3)
+
     sweep_in = input("Sweep t_min t_max n_slices [-1 1 101]: ").strip()
     if sweep_in:
         t_min, t_max, n_slices = sweep_in.split()
@@ -777,4 +1019,5 @@ if __name__ == "__main__":
         n_slices=n_slices,
         show_best_contour=True,
         show_A_vs_t=True,
+        contour_supercell=contour_supercell,
     )
