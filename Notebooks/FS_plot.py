@@ -292,8 +292,10 @@ def draw_bz_boundary(ax, lattice, nmax=3):
     if faces:
         ws_fill = Poly3DCollection(
             faces,
-            facecolors=(0.72, 0.80, 0.92, 0.18),
-            edgecolors="none",
+            facecolors=(0.67, 0.78, 0.92, 0.28),
+            edgecolors=(0.53, 0.63, 0.80, 0.35),
+            linewidths=0.6,
+            alpha=0.28,
         )
         ax.add_collection3d(ws_fill)
 
