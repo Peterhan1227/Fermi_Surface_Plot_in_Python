@@ -16,35 +16,39 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
-from skimage.measure import marching_cubes
 
-# Make local package imports work when running this script directly.
 repo_src = Path(__file__).resolve().parents[1] / "src"
 if str(repo_src) not in sys.path:
     sys.path.insert(0, str(repo_src))
 
-# --- imports (work in your repo OR in this sandbox) ---
 try:
-    from BZPlotter.coord import ReciprocalLattice  # your repo style
+    from BZPlotter.coord import ReciprocalLattice
 except Exception:  # pragma: no cover
     try:
-        from coord import ReciprocalLattice  # local sandbox style
+        from coord import ReciprocalLattice
     except Exception as e:
         raise ImportError("Could not import ReciprocalLattice (BZPlotter.coord or coord)") from e
 
 
 try:
-    from BZPlotter.plane import PlaneSpec, plane_grid  # your repo style
+    from BZPlotter.plane import PlaneSpec, plane_grid
 except Exception:  # pragma: no cover
     try:
-        from plane import PlaneSpec, plane_grid  # local sandbox style
+        from plane import PlaneSpec, plane_grid
     except Exception as e:
         raise ImportError("Could not import PlaneSpec/plane_grid (BZPlotter.plane or plane)") from e
 
 
-# -------------------------
-# Reading BXSF
-# -------------------------
+def _marching_cubes(*args, **kwargs):
+    try:
+        from skimage.measure import marching_cubes
+    except Exception as exc:  # pragma: no cover
+        raise ImportError(
+            "scikit-image is required for 3D Fermi-surface extraction. "
+            "Install scikit-image or skip 3D plotting."
+        ) from exc
+    return marching_cubes(*args, **kwargs)
+
 
 def read_bxsf(filename: str) -> dict:
     data = {
@@ -91,9 +95,41 @@ def read_bxsf(filename: str) -> dict:
     return data
 
 
-# -------------------------
-# WS BZ wireframe helpers (from fermi_bxsf_3)
-# -------------------------
+def _grid_period_lengths(grid: np.ndarray, tol=1e-8) -> np.ndarray:
+    """
+    Return the true periodic sample counts along each axis.
+
+    Some BXSF grids repeat the first plane at the last index (period N-1), while
+    others store N unique samples on [0,1). We detect that from the endpoint data.
+    """
+    arr = np.asarray(grid, dtype=float)
+    scale = max(float(np.max(np.abs(arr))), 1.0)
+    periods = []
+    for axis, n in enumerate(arr.shape):
+        first = np.take(arr, 0, axis=axis)
+        last = np.take(arr, n - 1, axis=axis)
+        repeated = np.max(np.abs(first - last)) <= tol * scale
+        periods.append(n - 1 if repeated else n)
+    return np.asarray(periods, dtype=float)
+
+
+def _periodic_supercell_triangles(
+    grid: np.ndarray,
+    level: float,
+    lattice: ReciprocalLattice,
+    origin: np.ndarray,
+    shift: np.ndarray,
+    reps=(3, 3, 3),
+):
+    """Build periodic isosurface triangles in Cartesian coordinates."""
+    periods = _grid_period_lengths(grid).astype(int)
+    core = np.asarray(grid)[tuple(slice(0, p) for p in periods)]
+    tiled = np.tile(core, reps)
+    verts, faces, _, _ = _marching_cubes(tiled, level)
+    frac = verts / periods[None, :] - (np.asarray(reps, dtype=float) // 2)[None, :]
+    verts_cart = lattice.frac_to_cart(origin + frac + shift)
+    return verts_cart[faces]
+
 
 def _lattice_translations(lattice: ReciprocalLattice, nmax=2, include_zero=True):
     nset = np.array(list(product(range(-nmax, nmax + 1), repeat=3)), dtype=float)
@@ -108,28 +144,89 @@ def _ws_normals(lattice: ReciprocalLattice, nmax=2):
     return np.unique(np.round(g, 12), axis=0)
 
 
-def fold_to_wigner_seitz(kpts: np.ndarray, lattice: ReciprocalLattice, nmax=2) -> np.ndarray:
-    """Fold points into first WS cell by nearest reciprocal-lattice translation."""
-    g_vectors = _lattice_translations(lattice, nmax=nmax, include_zero=True)
-    disp = kpts[:, None, :] - g_vectors[None, :, :]
-    idx = np.argmin(np.sum(disp**2, axis=2), axis=1)
-    return kpts - g_vectors[idx]
+def _compact_polygon_vertices(poly: np.ndarray, tol=1e-10) -> np.ndarray:
+    """Drop duplicate consecutive vertices introduced during clipping."""
+    if len(poly) == 0:
+        return poly
+
+    out = [poly[0]]
+    for pt in poly[1:]:
+        if np.linalg.norm(pt - out[-1]) > tol:
+            out.append(pt)
+
+    if len(out) > 1 and np.linalg.norm(out[0] - out[-1]) <= tol:
+        out.pop()
+    return np.asarray(out, dtype=float)
 
 
-def _ws_vertex_mask(kpts: np.ndarray, lattice: ReciprocalLattice, nmax=2, tol=1e-10) -> np.ndarray:
-    """Mask of points inside first WS cell around Gamma."""
-    g = _ws_normals(lattice, nmax=nmax)
-    rhs = 0.5 * np.sum(g * g, axis=1) + tol
-    return np.all(np.abs(kpts @ g.T) <= rhs[None, :], axis=1)
+def _clip_polygon_to_halfspace(
+    poly: np.ndarray, normal: np.ndarray, bound: float, tol=1e-10
+) -> np.ndarray:
+    """Clip a polygon against one WS half-space normal.x <= bound."""
+    if len(poly) == 0:
+        return poly
+
+    out = []
+    prev = poly[-1]
+    prev_val = np.dot(normal, prev) - bound
+    prev_in = prev_val <= tol
+
+    for curr in poly:
+        curr_val = np.dot(normal, curr) - bound
+        curr_in = curr_val <= tol
+
+        if curr_in != prev_in:
+            denom = prev_val - curr_val
+            if abs(denom) > tol:
+                t = prev_val / denom
+                out.append(prev + t * (curr - prev))
+
+        if curr_in:
+            out.append(curr)
+
+        prev = curr
+        prev_val = curr_val
+        prev_in = curr_in
+
+    if not out:
+        return np.empty((0, 3), dtype=float)
+    return _compact_polygon_vertices(np.asarray(out, dtype=float), tol=tol)
+
+
+def _clip_triangles_to_ws(
+    triangles: np.ndarray, lattice: ReciprocalLattice, nmax=2, tol=1e-10
+):
+    """Clip periodic triangles to the WS cell without creating a seam."""
+    normals = _ws_normals(lattice, nmax=nmax)
+    bvals = 0.5 * np.sum(normals * normals, axis=1)
+
+    clipped = []
+    for tri in triangles:
+        poly = np.asarray(tri, dtype=float)
+        for normal, bound in zip(normals, bvals):
+            poly = _clip_polygon_to_halfspace(poly, normal, bound, tol=tol)
+            if len(poly) < 3:
+                break
+
+        if len(poly) < 3:
+            continue
+
+        anchor = poly[0]
+        for i in range(1, len(poly) - 1):
+            clipped.append(np.vstack([anchor, poly[i], poly[i + 1]]))
+
+    if not clipped:
+        return np.empty((0, 3), dtype=float), np.empty((0, 3), dtype=int)
+
+    verts = np.asarray(clipped, dtype=float).reshape(-1, 3)
+    faces = np.arange(len(verts), dtype=int).reshape(-1, 3)
+    return verts, faces
 
 
 def _wrap_triangles_in_frac_cell(
     k_frac: np.ndarray, faces: np.ndarray, lattice: ReciprocalLattice, center=0.5
 ):
-    """
-    Wrap triangles coherently into one periodic image to avoid seam-spanning faces.
-    """
-    tri_frac = k_frac[faces]  # (Nf,3,3)
+    tri_frac = k_frac[faces]
     tri_centers = tri_frac.mean(axis=1)
     tri_centers_wrapped = lattice.wrap_frac(tri_centers, center=center)
     shifts = tri_centers - tri_centers_wrapped
@@ -174,9 +271,89 @@ def draw_bz_boundary(ax, lattice: ReciprocalLattice, nmax=2):
         ax.plot3D(*zip(p0, p1), color="black", lw=1.3, alpha=0.8)
 
 
-# -------------------------
-# 3D Fermi surface plot
-# -------------------------
+def _project_to_plane_coords(
+    pts: np.ndarray, center_cart: np.ndarray, u: np.ndarray, v: np.ndarray
+) -> np.ndarray:
+    rel = np.asarray(pts, dtype=float) - np.asarray(center_cart, dtype=float)
+    return np.column_stack([rel @ u, rel @ v])
+
+
+def _ws_slice_polygon(
+    lattice: ReciprocalLattice,
+    center_cart: np.ndarray,
+    u: np.ndarray,
+    v: np.ndarray,
+    n_hat: np.ndarray,
+    nmax=2,
+    tol=1e-9,
+) -> np.ndarray | None:
+    """Return the WS-cell cross-section polygon in the slice (s,t) coordinates."""
+    pts = []
+    center_cart = np.asarray(center_cart, dtype=float).reshape(3)
+    n_hat = np.asarray(n_hat, dtype=float).reshape(3)
+
+    for p0, p1 in _ws_polyhedron_edges(lattice, nmax=nmax):
+        d0 = float(np.dot(n_hat, p0 - center_cart))
+        d1 = float(np.dot(n_hat, p1 - center_cart))
+
+        if abs(d0) <= tol:
+            pts.append(p0)
+        if abs(d1) <= tol:
+            pts.append(p1)
+        if d0 * d1 < -tol * tol:
+            t = d0 / (d0 - d1)
+            pts.append(p0 + t * (p1 - p0))
+
+    if not pts:
+        return None
+
+    pts = np.unique(np.round(np.asarray(pts, dtype=float), 10), axis=0)
+    if len(pts) < 3:
+        return None
+
+    st = _project_to_plane_coords(pts, center_cart, u, v)
+    ctr = st.mean(axis=0)
+    ang = np.arctan2(st[:, 1] - ctr[1], st[:, 0] - ctr[0])
+    order = np.argsort(ang)
+    return st[order]
+
+
+def ws_t_window_along_normal(
+    lattice: ReciprocalLattice,
+    center_cart: np.ndarray,
+    normal_cart: np.ndarray,
+    *,
+    nmax=2,
+    tol=1e-12,
+) -> tuple[float, float] | None:
+    """Return the WS-cell t-interval for center_cart + t * n_hat."""
+    center = np.asarray(center_cart, dtype=float).reshape(3)
+    n_hat = np.asarray(normal_cart, dtype=float).reshape(3)
+    n_norm = np.linalg.norm(n_hat)
+    if n_norm < tol:
+        raise ValueError("normal_cart has near-zero norm.")
+    n_hat = n_hat / n_norm
+
+    normals = _ws_normals(lattice, nmax=nmax)
+    bvals = 0.5 * np.sum(normals * normals, axis=1)
+
+    t_lo = -np.inf
+    t_hi = np.inf
+    for g, bound in zip(normals, bvals):
+        denom = float(np.dot(g, n_hat))
+        rhs = float(bound - np.dot(g, center))
+        if abs(denom) <= tol:
+            if rhs < -tol:
+                return None
+            continue
+        t_bound = rhs / denom
+        if denom > 0.0:
+            t_hi = min(t_hi, t_bound)
+        else:
+            t_lo = max(t_lo, t_bound)
+
+    return float(t_lo), float(t_hi)
+
 
 def plot_fermi_surface(
     data: dict,
@@ -185,41 +362,25 @@ def plot_fermi_surface(
 ):
     ef = data["fermi_energy"]
     grid = data["band_data"][band_idx]
-    nx, ny, nz = data["grid_dimensions"]
     lattice = ReciprocalLattice.from_B(np.array(data["vectors"], dtype=float).T)
 
-    verts, faces, _, _ = marching_cubes(grid, ef)
-
-    frac_grid = np.column_stack(
-        [
-            verts[:, 0] / (nx - 1),
-            verts[:, 1] / (ny - 1),
-            verts[:, 2] / (nz - 1),
-        ]
-    )
-
     origin = np.asarray(data.get("origin", (0.0, 0.0, 0.0)), dtype=float).reshape(3)
-    k_frac = origin + frac_grid
-    verts_base, faces_base = _wrap_triangles_in_frac_cell(
-        k_frac, faces, lattice, center=0.5
-    )
+    shift = np.zeros(3, dtype=float)
 
-    verts_plot = verts_base
-    faces_plot = faces_base
     if fold_ws:
-        tri = verts_base[faces_base]
-        centers = tri.mean(axis=1)
-        centers_folded = fold_to_wigner_seitz(centers, lattice, nmax=2)
-        shifts = centers - centers_folded
-        tri_folded = tri - shifts[:, None, :]
+        tri_super = _periodic_supercell_triangles(grid, ef, lattice, origin, shift)
+        verts_plot, faces_plot = _clip_triangles_to_ws(tri_super, lattice, nmax=2)
+    else:
+        periods = _grid_period_lengths(grid)
+        verts, faces, _, _ = _marching_cubes(grid, ef)
+        frac_grid = verts / periods[None, :]
+        k_frac = origin + frac_grid
+        verts_plot, faces_plot = _wrap_triangles_in_frac_cell(
+            k_frac, faces, lattice, center=0.5
+        )
 
-        tri_points = tri_folded.reshape(-1, 3)
-        in_ws = _ws_vertex_mask(tri_points, lattice, nmax=2).reshape(-1, 3)
-        keep = np.all(in_ws, axis=1)
-        tri_keep = tri_folded[keep]
-        if len(tri_keep) > 0:
-            verts_plot = tri_keep.reshape(-1, 3)
-            faces_plot = np.arange(len(verts_plot), dtype=int).reshape(-1, 3)
+    if len(faces_plot) == 0:
+        raise ValueError("No Fermi-surface triangles remain after WS clipping.")
 
     fig = plt.figure(figsize=(10, 8))
     ax = fig.add_subplot(111, projection="3d")
@@ -241,22 +402,13 @@ def plot_fermi_surface(
     ymin, ymax = ax.get_ylim3d()
     zmin, zmax = ax.get_zlim3d()
     ax.set_box_aspect((xmax - xmin, ymax - ymin, zmax - zmin))
-    ax.set_proj_type("ortho")  # optional, better for geometry comparison
+    ax.set_proj_type("ortho")
     plt.show()
 
 
-# -------------------------
-# Plane grid + trilinear interpolation on periodic BXSF grid
-# -------------------------
-
 def interp_trilinear_periodic(grid: np.ndarray, xyz: np.ndarray) -> np.ndarray:
-    """Trilinear interpolation for points in index coordinates (x,y,z).
-
-    Assumes BXSF-style periodic grid where last index repeats the first, so the
-    true period is (Nx-1, Ny-1, Nz-1).
-    """
-    nx, ny, nz = grid.shape
-    px, py, pz = nx - 1, ny - 1, nz - 1
+    """Trilinear interpolation for points in index coordinates (x,y,z)."""
+    px, py, pz = _grid_period_lengths(grid).astype(int)
 
     x = xyz[:, 0]
     y = xyz[:, 1]
@@ -291,11 +443,10 @@ def interp_trilinear_periodic(grid: np.ndarray, xyz: np.ndarray) -> np.ndarray:
     c0 = c00 * (1 - ty) + c10 * ty
     c1 = c01 * (1 - ty) + c11 * ty
 
-
     return c0 * (1 - tz) + c1 * tz
 
+
 def _default_orient_hint_from_normal(normal_cart: np.ndarray) -> np.ndarray:
-    """Build a perpendicular orient_hint from cross(normal, [1,0,0])."""
     n = np.asarray(normal_cart, dtype=float).reshape(3)
     n_norm = np.linalg.norm(n)
     if n_norm < 1e-12:
@@ -309,6 +460,7 @@ def _default_orient_hint_from_normal(normal_cart: np.ndarray) -> np.ndarray:
         hint = np.cross(n, ey)
     return hint
 
+
 def energies_on_plane_from_bxsf(
     data: dict,
     band_idx: int,
@@ -319,10 +471,9 @@ def energies_on_plane_from_bxsf(
     shape=(401, 401),
     half_range=(1.0, 1.0),
 ):
-    """Return (S,T,E2d,u,v,n,lattice) where E2d has shape (Ny,Nx)."""
     grid = data["band_data"][band_idx]
-    nx, ny, nz = data["grid_dimensions"]
     lattice = ReciprocalLattice.from_B(np.array(data["vectors"], dtype=float).T)
+    periods = _grid_period_lengths(grid)
     normal_arr = np.asarray(normal_cart, dtype=float).reshape(3)
     n_norm = np.linalg.norm(normal_arr)
     if n_norm < 1e-12:
@@ -348,15 +499,14 @@ def energies_on_plane_from_bxsf(
 
     pts, S, T, u, v, n = plane_grid(spec, return_mesh=True, return_basis=True)
 
-    # Cartesian k -> grid-fractional coordinates in the BXSF data cell.
     origin = np.asarray(data.get("origin", (0.0, 0.0, 0.0)), dtype=float).reshape(3)
     frac = lattice.cart_to_frac(pts) - origin
-    frac = frac - np.floor(frac)  # wrap to [0,1) for periodic interpolation
+    frac = frac - np.floor(frac)
 
     xyz = np.column_stack([
-        frac[:, 0] * (nx - 1),
-        frac[:, 1] * (ny - 1),
-        frac[:, 2] * (nz - 1),
+        frac[:, 0] * periods[0],
+        frac[:, 1] * periods[1],
+        frac[:, 2] * periods[2],
     ])
 
     e = interp_trilinear_periodic(grid, xyz)
@@ -364,12 +514,7 @@ def energies_on_plane_from_bxsf(
     return S, T, E2d, u, v, n, lattice
 
 
-# -------------------------
-# Area + frequency
-# -------------------------
-
 def polygon_area(xy: np.ndarray) -> float:
-    """Shoelace area for a closed polygon given by points (N,2)."""
     if len(xy) < 3:
         return 0.0
     x = xy[:, 0]
@@ -377,94 +522,95 @@ def polygon_area(xy: np.ndarray) -> float:
     return 0.5 * abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1)))
 
 
-def contour_areas(S: np.ndarray, T: np.ndarray, E2d: np.ndarray, level: float):
-    """Return list of areas (in plane coords, i.e. A^-2) for closed E=level contours."""
-    cs = plt.contour(S, T, E2d, levels=[level])
-    areas = []
+def contour_segments(
+    S: np.ndarray, T: np.ndarray, E2d: np.ndarray, level: float, close_tol=1e-5
+):
+    fig, ax = plt.subplots()
+    cs = ax.contour(S, T, E2d, levels=[level])
+    segments = []
 
-    # Matplotlib compatibility: prefer allsegs (newer), fallback to collections (older).
     if hasattr(cs, "allsegs") and cs.allsegs:
         for seg in cs.allsegs[0]:
             v = np.asarray(seg)
             if len(v) < 3:
                 continue
-            if np.linalg.norm(v[0] - v[-1]) > 1e-10:
-                v = np.vstack([v, v[0]])
-            areas.append(polygon_area(v[:-1]))
+            closed = np.linalg.norm(v[0] - v[-1]) <= close_tol
+            if closed:
+                v = v[:-1]
+            segments.append((v, closed))
     else:
         for coll in getattr(cs, "collections", []):
             for p in coll.get_paths():
-                v = p.vertices
+                v = np.asarray(p.vertices)
                 if len(v) < 3:
                     continue
-                if np.linalg.norm(v[0] - v[-1]) > 1e-10:
-                    v = np.vstack([v, v[0]])
-                areas.append(polygon_area(v[:-1]))
+                closed = np.linalg.norm(v[0] - v[-1]) <= close_tol
+                if closed:
+                    v = v[:-1]
+                segments.append((v, closed))
 
-    plt.close()
+    plt.close(fig)
+    return segments
+
+
+def contour_areas(S: np.ndarray, T: np.ndarray, E2d: np.ndarray, level: float):
+    areas = []
+    for v, closed in contour_segments(S, T, E2d, level):
+        if not closed or len(v) < 3:
+            continue
+        areas.append(polygon_area(v))
     return areas
 
+
+def _plot_slice_contours(
+    S: np.ndarray,
+    T: np.ndarray,
+    E2d: np.ndarray,
+    level: float,
+    *,
+    center_cart: np.ndarray,
+    u: np.ndarray,
+    v: np.ndarray,
+    n_hat: np.ndarray,
+    lattice: ReciprocalLattice,
+    title: str,
+):
+    segments = contour_segments(S, T, E2d, level)
+    ws_poly = _ws_slice_polygon(lattice, center_cart, u, v, n_hat, nmax=2)
+    n_closed = sum(int(closed) for _, closed in segments)
+    n_open = len(segments) - n_closed
+
+    plt.figure(figsize=(7, 6))
+    for seg, closed in segments:
+        if len(seg) < 2:
+            continue
+        plt.plot(
+            seg[:, 0],
+            seg[:, 1],
+            color=("C0" if closed else "C1"),
+            ls=("-" if closed else "--"),
+            lw=1.5,
+        )
+
+    if ws_poly is not None:
+        poly = np.vstack([ws_poly, ws_poly[0]])
+        plt.plot(poly[:, 0], poly[:, 1], color="black", lw=1.2)
+
+    plt.gca().set_aspect("equal", adjustable="box")
+    plt.title(f"{title}\nclosed={n_closed}, open={n_open}")
+    plt.xlabel("s (A^-1)")
+    plt.ylabel("t (A^-1)")
+    plt.tight_layout()
+    plt.show()
+
+    return segments, n_closed, n_open
+
+
 def area_to_frequency_T(area_Ainv2: float) -> float:
-    """Onsager relation: F = (hbar / (2*pi*e)) * A."""
-    hbar = 1.054_571_817e-34  # J*s
-    e = 1.602_176_634e-19     # C
+    hbar = 1.054_571_817e-34
+    e = 1.602_176_634e-19
     area_m2inv = area_Ainv2 * 1e20
     return (hbar / (2 * np.pi * e)) * area_m2inv
-
-
-# -------------------------
-# User-facing workflow
-# -------------------------
-
-def slice_and_dhva(
-    data: dict,
-    band_idx: int,
-    *,
-    center_frac=(0.0, 0.0, 0.0),
-    normal_cart=(0.0, 0.0, 1.0),
-    orient_hint_cart=None,
-    shape=(401, 401),
-    half_range=(1.0, 1.0),
-    show=True,
-):
-    ef = float(data["fermi_energy"])
-    lattice = ReciprocalLattice.from_B(np.array(data["vectors"], dtype=float).T)
-
-    center_cart = lattice.frac_to_cart(np.asarray(center_frac, dtype=float))
-
-    S, T, E2d, *_ = energies_on_plane_from_bxsf(
-        data,
-        band_idx,
-        center_cart=center_cart,
-        normal_cart=np.asarray(normal_cart, dtype=float),
-        orient_hint_cart=orient_hint_cart,
-        shape=shape,
-        half_range=half_range,
-    )
-
-    areas = contour_areas(S, T, E2d, ef)
-    areas = sorted([a for a in areas if a > 0], reverse=True)
-    freqs = [area_to_frequency_T(a) for a in areas]
-
-    if show:
-        plt.figure(figsize=(7, 6))
-        plt.contour(S, T, E2d, levels=[ef])
-        plt.gca().set_aspect("equal", adjustable="box")
-        plt.title(f"Band {band_idx} slice: E=E_F contours\nnormal ~ {np.asarray(normal_cart)}")
-        plt.xlabel("s (A^-1)")
-        plt.ylabel("t (A^-1)")
-        plt.show()
-
-        if areas:
-            a0 = areas[0]
-            f0 = freqs[0]
-            print(f"Contours found: {len(areas)}")
-            print(f"Largest area: {a0:.6g} A^-2")
-            print(f"Frequency:    {f0:.6g} T  ({f0/1e3:.6g} kT)")
-        else:
-            print("No closed E=E_F contours found on this slice.")
-
-    return areas, freqs
 
 
 def sweep_slices_and_dhva_max(
@@ -482,11 +628,8 @@ def sweep_slices_and_dhva_max(
     force_include_t0=True,
     show_best_contour=True,
     show_A_vs_t=True,
+    area_tol=1e-4,
 ):
-    """
-    Sweep parallel planes along the normal direction and find the slice
-    with the largest closed E=E_F contour area.
-    """
     ef = float(data["fermi_energy"])
     lattice = ReciprocalLattice.from_B(np.array(data["vectors"], dtype=float).T)
 
@@ -502,6 +645,8 @@ def sweep_slices_and_dhva_max(
     if n_slices < 1:
         raise ValueError("n_slices must be >= 1.")
 
+    ws_t_window = ws_t_window_along_normal(lattice, center_cart0, n_hat, nmax=2)
+
     t_min = float(t_min)
     t_max = float(t_max)
     t_vals = np.linspace(t_min, t_max, n_slices)
@@ -509,15 +654,24 @@ def sweep_slices_and_dhva_max(
         if not np.any(np.isclose(t_vals, 0.0, atol=1e-12, rtol=0.0)):
             t_vals = np.sort(np.unique(np.concatenate([t_vals, np.array([0.0])])))
 
+    def _empty_orbit_record(mode: str) -> dict:
+        area0 = 0.0 if mode == "max" else np.inf
+        return {
+            "t0": None,
+            "area_Ainv2": area0,
+            "freq_T": 0.0,
+            "n_contours": 0,
+            "center_cart": None,
+            "center_frac": None,
+            "areas_Ainv2": [],
+            "freqs_T": [],
+        }
+
     best = {
-        "t0": None,
-        "area_Ainv2": 0.0,
-        "freq_T": 0.0,
-        "n_contours": 0,
-        "center_cart": None,
-        "center_frac": None,
-        "areas_Ainv2": [],
-        "freqs_T": [],
+        "max": _empty_orbit_record("max"),
+        "min": _empty_orbit_record("min"),
+        "max_t0": None,
+        "min_t0": None,
     }
     center_plane = {
         "evaluated": False,
@@ -525,7 +679,7 @@ def sweep_slices_and_dhva_max(
         "freq_T": 0.0,
         "n_contours": 0,
     }
-    A_of_t = []  # (t0, max_area, n_contours)
+    A_of_t = []
 
     for t0 in t_vals:
         center_cart = center_cart0 + t0 * n_hat
@@ -539,8 +693,9 @@ def sweep_slices_and_dhva_max(
             half_range=half_range,
         )
 
-        areas = sorted((a for a in contour_areas(S, T, E2d, ef) if a > 0.0), reverse=True)
-        amax = float(areas[0]) if areas else 0.0
+        areas = [float(a) for a in contour_areas(S, T, E2d, ef) if a > area_tol]
+        amax = max(areas) if areas else 0.0
+        amin = min(areas) if areas else 0.0
         A_of_t.append((float(t0), amax, float(len(areas))))
 
         if np.isclose(t0, 0.0, atol=1e-12, rtol=0.0):
@@ -549,19 +704,37 @@ def sweep_slices_and_dhva_max(
             center_plane["freq_T"] = float(area_to_frequency_T(amax)) if amax > 0.0 else 0.0
             center_plane["n_contours"] = int(len(areas))
 
-        if areas and amax > best["area_Ainv2"]:
-            best["t0"] = float(t0)
-            best["area_Ainv2"] = amax
-            best["freq_T"] = float(area_to_frequency_T(amax))
-            best["n_contours"] = int(len(areas))
-            best["center_cart"] = center_cart
-            best["center_frac"] = lattice.cart_to_frac(center_cart)
-            best["areas_Ainv2"] = areas
-            best["freqs_T"] = [area_to_frequency_T(a) for a in areas]
+        if areas and amax > best["max"]["area_Ainv2"]:
+            areas_desc = sorted(areas, reverse=True)
+            best["max"] = {
+                "t0": float(t0),
+                "area_Ainv2": float(amax),
+                "freq_T": float(area_to_frequency_T(amax)),
+                "n_contours": int(len(areas)),
+                "center_cart": center_cart,
+                "center_frac": lattice.cart_to_frac(center_cart),
+                "areas_Ainv2": areas_desc,
+                "freqs_T": [area_to_frequency_T(a) for a in areas_desc],
+            }
+            best["max_t0"] = best["max"]["t0"]
+
+        if areas and amin < best["min"]["area_Ainv2"]:
+            areas_asc = sorted(areas)
+            best["min"] = {
+                "t0": float(t0),
+                "area_Ainv2": float(amin),
+                "freq_T": float(area_to_frequency_T(amin)),
+                "n_contours": int(len(areas)),
+                "center_cart": center_cart,
+                "center_frac": lattice.cart_to_frac(center_cart),
+                "areas_Ainv2": areas_asc,
+                "freqs_T": [area_to_frequency_T(a) for a in areas_asc],
+            }
+            best["min_t0"] = best["min"]["t0"]
 
     A_of_t = np.asarray(A_of_t, dtype=float)
 
-    if show_A_vs_t:
+    if show_A_vs_t and len(A_of_t) > 0:
         plt.figure(figsize=(7, 4))
         plt.plot(A_of_t[:, 0], A_of_t[:, 1])
         plt.xlabel("t0 (offset along normal; k-units)")
@@ -570,42 +743,74 @@ def sweep_slices_and_dhva_max(
         plt.tight_layout()
         plt.show()
 
-    if show_best_contour and best["t0"] is not None:
-        center_cart_best = best["center_cart"]
-        S, T, E2d, *_ = energies_on_plane_from_bxsf(
-            data,
-            band_idx,
-            center_cart=center_cart_best,
-            normal_cart=n_hat,
-            orient_hint_cart=orient_hint_cart,
-            shape=shape,
-            half_range=half_range,
-        )
+    if show_best_contour:
+        for label in ("max", "min"):
+            record = best[label]
+            if record["t0"] is None:
+                continue
 
-        plt.figure(figsize=(7, 6))
-        plt.contour(S, T, E2d, levels=[ef])
-        plt.gca().set_aspect("equal", adjustable="box")
-        plt.title(
-            f"Best slice (t0={best['t0']:.6g}): E=E_F contours\n"
-            f"Amax={best['area_Ainv2']:.6g} A^-2, F={best['freq_T']:.6g} T"
-        )
-        plt.xlabel("s (A^-1)")
-        plt.ylabel("t (A^-1)")
-        plt.tight_layout()
-        plt.show()
+            S, T, E2d, u, v, n_best, _ = energies_on_plane_from_bxsf(
+                data,
+                band_idx,
+                center_cart=record["center_cart"],
+                normal_cart=n_hat,
+                orient_hint_cart=orient_hint_cart,
+                shape=shape,
+                half_range=half_range,
+            )
 
-    if best["t0"] is None:
+            orbit_name = "Maximum orbit slice" if label == "max" else "Minimum non-zero orbit slice"
+            area_name = "Amax" if label == "max" else "Amin"
+            _plot_slice_contours(
+                S,
+                T,
+                E2d,
+                ef,
+                center_cart=record["center_cart"],
+                u=u,
+                v=v,
+                n_hat=n_best,
+                lattice=lattice,
+                title=(
+                    f"{orbit_name} (t0={record['t0']:.6g}): E=E_F contours\n"
+                    f"{area_name}={record['area_Ainv2']:.6g} A^-2, F={record['freq_T']:.6g} T"
+                ),
+            )
+
+    if best["max"]["t0"] is None:
         print("No closed E=E_F contours found on any slice in the sweep.")
     else:
-        frac_str = np.array2string(best["center_frac"], precision=6, separator=", ")
-        cart_str = np.array2string(best["center_cart"], precision=6, separator=", ")
+        max_frac_str = np.array2string(best["max"]["center_frac"], precision=6, separator=", ")
+        max_cart_str = np.array2string(best["max"]["center_cart"], precision=6, separator=", ")
+        min_frac_str = np.array2string(best["min"]["center_frac"], precision=6, separator=", ")
+        min_cart_str = np.array2string(best["min"]["center_cart"], precision=6, separator=", ")
         print(f"Sweep complete: {len(t_vals)} slices")
-        print(f"Best offset t0: {best['t0']:.6g}")
-        print(f"Best center (frac): {frac_str}")
-        print(f"Best center (cart): {cart_str}")
-        print(f"Max area: {best['area_Ainv2']:.6g} A^-2")
-        print(f"Frequency: {best['freq_T']:.6g} T ({best['freq_T']/1e3:.6g} kT)")
-        print(f"Contours on best slice: {best['n_contours']}")
+        if ws_t_window is not None:
+            print(
+                f"WS t-window along normal: [{ws_t_window[0]:.6g}, {ws_t_window[1]:.6g}]"
+            )
+            if t_min > ws_t_window[0] or t_max < ws_t_window[1]:
+                print(
+                    "Sweep range does not cover the full WS interval along this normal."
+                )
+        print(f"Max-orbit offset t0: {best['max']['t0']:.6g}")
+        print(f"Max-orbit center (frac): {max_frac_str}")
+        print(f"Max-orbit center (cart): {max_cart_str}")
+        print(f"Max area: {best['max']['area_Ainv2']:.6g} A^-2")
+        print(
+            f"Max frequency: {best['max']['freq_T']:.6g} T "
+            f"({best['max']['freq_T']/1e3:.6g} kT)"
+        )
+        print(f"Contours on max-orbit slice: {best['max']['n_contours']}")
+        print(f"Min-orbit offset t0: {best['min']['t0']:.6g}")
+        print(f"Min-orbit center (frac): {min_frac_str}")
+        print(f"Min-orbit center (cart): {min_cart_str}")
+        print(f"Min non-zero area: {best['min']['area_Ainv2']:.6g} A^-2")
+        print(
+            f"Min non-zero frequency: {best['min']['freq_T']:.6g} T "
+            f"({best['min']['freq_T']/1e3:.6g} kT)"
+        )
+        print(f"Contours on min-orbit slice: {best['min']['n_contours']}")
         if center_plane["evaluated"]:
             print(
                 f"Center plane (t0=0): {center_plane['area_Ainv2']:.6g} A^-2, "
@@ -613,12 +818,20 @@ def sweep_slices_and_dhva_max(
                 f"contours={center_plane['n_contours']}"
             )
         print(
-            "All contour areas on best slice (A^-2): "
-            + ", ".join(f"{a:.6g}" for a in best["areas_Ainv2"])
+            "All contour areas on max-orbit slice (A^-2): "
+            + ", ".join(f"{a:.6g}" for a in best["max"]["areas_Ainv2"])
         )
         print(
-            "All dHvA frequencies on best slice (T): "
-            + ", ".join(f"{f:.6g}" for f in best["freqs_T"])
+            "All dHvA frequencies on max-orbit slice (T): "
+            + ", ".join(f"{f:.6g}" for f in best["max"]["freqs_T"])
+        )
+        print(
+            "All contour areas on min-orbit slice (A^-2): "
+            + ", ".join(f"{a:.6g}" for a in best["min"]["areas_Ainv2"])
+        )
+        print(
+            "All dHvA frequencies on min-orbit slice (T): "
+            + ", ".join(f"{f:.6g}" for f in best["min"]["freqs_T"])
         )
 
     return best, A_of_t
@@ -628,6 +841,7 @@ if __name__ == "__main__":
     path = input("Path to .bxsf file: ").strip()
     data = read_bxsf(path)
     print(f"Loaded {len(data['band_data'])} bands. E_F = {data['fermi_energy']}")
+    lattice = ReciprocalLattice.from_B(np.array(data["vectors"], dtype=float).T)
 
     band = int(input("Band index: ").strip())
 
@@ -635,17 +849,23 @@ if __name__ == "__main__":
     if do3d:
         plot_fermi_surface(data, band)
 
-    # Plane inputs (keep it simple, defaults work)
     c_in = input("Center (fractional b1 b2 b3) [0 0 0]: ").strip()
     center_frac = tuple(map(float, c_in.split())) if c_in else (0.0, 0.0, 0.0)
 
     n_in = input("Normal (Cartesian) [0 0 1]: ").strip()
     normal_cart = tuple(map(float, n_in.split())) if n_in else (0.0, 0.0, 1.0)
+    center_cart = lattice.frac_to_cart(np.asarray(center_frac, dtype=float))
+    ws_t_window = ws_t_window_along_normal(lattice, center_cart, normal_cart, nmax=2)
+    if ws_t_window is None:
+        print("WS t-window along normal: none (center lies outside the first WS cell).")
+    else:
+        print(f"WS t-window along normal: [{ws_t_window[0]:.6g}, {ws_t_window[1]:.6g}]")
+
     o_in = input("Orient hint (Cartesian) [Enter for auto: cross(normal, [1 0 0])]: ").strip()
     orient_hint = tuple(map(float, o_in.split())) if o_in else None
 
-    r_in = input("Half-range rx ry (A^-1) [1 1]: ").strip()
-    half_range = tuple(map(float, r_in.split())) if r_in else (1.0, 1.0)
+    r_in = input("Half-range rx ry (A^-1) [1.5 1.5]: ").strip()
+    half_range = tuple(map(float, r_in.split())) if r_in else (1.5, 1.5)
 
     s_in = input("Grid Nx Ny [401 401]: ").strip()
     shape = tuple(map(int, s_in.split())) if s_in else (401, 401)
@@ -671,4 +891,3 @@ if __name__ == "__main__":
         show_best_contour=True,
         show_A_vs_t=True,
     )
-
